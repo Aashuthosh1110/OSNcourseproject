@@ -1,0 +1,3 @@
+Special characters: !@#$%^&*()
+Numbers: 1234567890
+This file tests special characters.
