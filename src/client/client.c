@@ -317,9 +317,111 @@ void handle_view_command(command_t cmd, const char* args) {
     }
 }
 
+// Phase 5.2: Handle READ command - get location from NM, then read from SS
 void handle_read_command(command_t cmd, const char* args) { 
     (void)cmd;
-    printf("READ command not yet implemented. Args: %s\n", args ? args : "none"); 
+    
+    // Parse filename from args
+    char filename[MAX_FILENAME_LEN];
+    if (args == NULL || strlen(args) == 0) {
+        printf("Error: No filename specified\n");
+        printf("Usage: READ <filename>\n");
+        return;
+    }
+    
+    sscanf(args, "%s", filename);
+    
+    // Step 1: Ask Name Server for storage server location
+    request_packet_t request;
+    memset(&request, 0, sizeof(request));
+    request.magic = PROTOCOL_MAGIC;
+    request.command = CMD_READ;
+    strncpy(request.username, username, sizeof(request.username) - 1);
+    strncpy(request.args, filename, sizeof(request.args) - 1);
+    request.checksum = calculate_checksum(&request, sizeof(request) - sizeof(uint32_t));
+    
+    if (send_packet(nm_socket, &request) < 0) {
+        printf("Error: Failed to send READ request to Name Server\n");
+        return;
+    }
+    
+    // Step 2: Get response from Name Server
+    response_packet_t response;
+    if (recv_packet(nm_socket, &response) <= 0) {
+        printf("Error: No response from Name Server\n");
+        return;
+    }
+    
+    if (response.status != STATUS_OK) {
+        printf("Error: %s\n", response.data);
+        return;
+    }
+    
+    // Step 3: Parse Storage Server location (format: "IP:PORT")
+    char ss_ip[INET_ADDRSTRLEN];
+    int ss_port;
+    if (sscanf(response.data, "%[^:]:%d", ss_ip, &ss_port) != 2) {
+        printf("Error: Invalid storage server location: %s\n", response.data);
+        return;
+    }
+    
+    printf("Connecting to Storage Server at %s:%d...\n", ss_ip, ss_port);
+    
+    // Step 4: Connect to Storage Server
+    int ss_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (ss_socket == -1) {
+        printf("Error: Failed to create socket\n");
+        return;
+    }
+    
+    struct sockaddr_in ss_addr;
+    memset(&ss_addr, 0, sizeof(ss_addr));
+    ss_addr.sin_family = AF_INET;
+    ss_addr.sin_port = htons(ss_port);
+    
+    if (inet_pton(AF_INET, ss_ip, &ss_addr.sin_addr) <= 0) {
+        printf("Error: Invalid storage server address\n");
+        close(ss_socket);
+        return;
+    }
+    
+    if (connect(ss_socket, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) == -1) {
+        printf("Error: Failed to connect to storage server: %s\n", strerror(errno));
+        close(ss_socket);
+        return;
+    }
+    
+    // Step 5: Send READ request to Storage Server
+    memset(&request, 0, sizeof(request));
+    request.magic = PROTOCOL_MAGIC;
+    request.command = CMD_READ;
+    strncpy(request.username, username, sizeof(request.username) - 1);
+    strncpy(request.args, filename, sizeof(request.args) - 1);
+    request.checksum = calculate_checksum(&request, sizeof(request) - sizeof(uint32_t));
+    
+    if (send_packet(ss_socket, &request) < 0) {
+        printf("Error: Failed to send READ request to storage server\n");
+        close(ss_socket);
+        return;
+    }
+    
+    // Step 6: Read file content from Storage Server
+    printf("\n--- File Content: %s ---\n", filename);
+    char buffer[4096];
+    ssize_t bytes;
+    
+    while ((bytes = recv(ss_socket, buffer, sizeof(buffer) - 1, 0)) > 0) {
+        buffer[bytes] = '\0';
+        printf("%s", buffer);
+    }
+    
+    if (bytes < 0) {
+        printf("\nError: Failed to read from storage server\n");
+    } else {
+        printf("\n--- End of File ---\n");
+    }
+    
+    close(ss_socket);
 }
 
 void handle_create_command(command_t cmd, const char* args) {
@@ -381,7 +483,199 @@ void handle_create_command(command_t cmd, const char* args) {
 
 void handle_write_command(command_t cmd, const char* args) { 
     (void)cmd;
-    printf("WRITE command not yet implemented. Args: %s\n", args ? args : "none"); 
+    
+    // Parse filename and sentence number from args
+    char filename[MAX_FILENAME_LEN];
+    int sentence_num = 0;
+    
+    if (args == NULL || sscanf(args, "%s %d", filename, &sentence_num) != 2) {
+        printf("Error: WRITE requires filename and sentence number\n");
+        printf("Usage: WRITE <filename> <sentence_num>\n");
+        return;
+    }
+    
+    // Step 1: Ask Name Server for storage server location
+    request_packet_t request;
+    memset(&request, 0, sizeof(request));
+    request.magic = PROTOCOL_MAGIC;
+    request.command = CMD_WRITE;
+    strncpy(request.username, username, sizeof(request.username) - 1);
+    snprintf(request.args, sizeof(request.args), "%s %d", filename, sentence_num);
+    request.checksum = calculate_checksum(&request, sizeof(request) - sizeof(uint32_t));
+    
+    if (send_packet(nm_socket, &request) < 0) {
+        printf("Error: Failed to send WRITE request to name server\n");
+        return;
+    }
+    
+    // Step 2: Receive response from Name Server
+    response_packet_t response;
+    if (recv_packet(nm_socket, &response) <= 0) {
+        printf("Error: Failed to receive response from name server\n");
+        return;
+    }
+    
+    if (response.status != STATUS_OK) {
+        printf("Error: %s\n", response.data);
+        return;
+    }
+    
+    // Step 3: Parse SS IP:PORT from response
+    char ss_ip[INET_ADDRSTRLEN];
+    int ss_port;
+    if (sscanf(response.data, "%[^:]:%d", ss_ip, &ss_port) != 2) {
+        printf("Error: Invalid storage server location: %s\n", response.data);
+        return;
+    }
+    
+    // Step 4: Connect to Storage Server
+    int ss_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (ss_socket < 0) {
+        printf("Error: Failed to create socket for storage server\n");
+        return;
+    }
+    
+    struct sockaddr_in ss_addr;
+    memset(&ss_addr, 0, sizeof(ss_addr));
+    ss_addr.sin_family = AF_INET;
+    ss_addr.sin_port = htons(ss_port);
+    
+    if (inet_pton(AF_INET, ss_ip, &ss_addr.sin_addr) <= 0) {
+        printf("Error: Invalid storage server IP address: %s\n", ss_ip);
+        close(ss_socket);
+        return;
+    }
+    
+    if (connect(ss_socket, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) < 0) {
+        printf("Error: Failed to connect to storage server at %s:%d\n", ss_ip, ss_port);
+        close(ss_socket);
+        return;
+    }
+    
+    // Step 5: Send initial WRITE request to Storage Server
+    memset(&request, 0, sizeof(request));
+    request.magic = PROTOCOL_MAGIC;
+    request.command = CMD_WRITE;
+    strncpy(request.username, username, sizeof(request.username) - 1);
+    snprintf(request.args, sizeof(request.args), "%s %d", filename, sentence_num);
+    request.checksum = calculate_checksum(&request, sizeof(request) - sizeof(uint32_t));
+    
+    if (send_packet(ss_socket, &request) < 0) {
+        printf("Error: Failed to send WRITE request to storage server\n");
+        close(ss_socket);
+        return;
+    }
+    
+    // Step 6: Receive response from Storage Server (lock acquisition)
+    if (recv_packet(ss_socket, &response) <= 0) {
+        printf("Error: Failed to receive response from storage server\n");
+        close(ss_socket);
+        return;
+    }
+    
+    if (response.status != STATUS_OK) {
+        printf("Error: %s\n", response.data);
+        close(ss_socket);
+        return;
+    }
+    
+    printf("Lock acquired for sentence %d of '%s'\n", sentence_num, filename);
+    printf("Enter word updates in format: <word_index> <content>\n");
+    printf("Type 'ETIRW' when done to save changes\n");
+    
+    // Step 7: Enter interactive word update loop
+    char* line = NULL;
+    while (1) {
+        line = readline("WRITE> ");
+        if (line == NULL) {
+            // EOF or error
+            break;
+        }
+        
+        // Trim whitespace
+        char* trimmed = line;
+        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+        
+        if (strlen(trimmed) == 0) {
+            free(line);
+            continue;
+        }
+        
+        add_history(line);
+        
+        // Check for ETIRW command
+        if (strcmp(trimmed, "ETIRW") == 0 || strcmp(trimmed, "etirw") == 0) {
+            // Send ETIRW command
+            memset(&request, 0, sizeof(request));
+            request.magic = PROTOCOL_MAGIC;
+            request.command = CMD_ETIRW;
+            strncpy(request.username, username, sizeof(request.username) - 1);
+            strncpy(request.args, filename, sizeof(request.args) - 1);
+            request.checksum = calculate_checksum(&request, sizeof(request) - sizeof(uint32_t));
+            
+            if (send_packet(ss_socket, &request) < 0) {
+                printf("Error: Failed to send ETIRW command\n");
+                free(line);
+                break;
+            }
+            
+            // Receive ETIRW response
+            if (recv_packet(ss_socket, &response) <= 0) {
+                printf("Error: Failed to receive ETIRW response\n");
+                free(line);
+                break;
+            }
+            
+            if (response.status == STATUS_OK) {
+                printf("Changes saved successfully\n");
+            } else {
+                printf("Error saving changes: %s\n", response.data);
+            }
+            
+            free(line);
+            break;
+        }
+        
+        // Parse word_index and content
+        int word_index;
+        char content[MAX_WORD_LEN];
+        if (sscanf(trimmed, "%d %s", &word_index, content) != 2) {
+            printf("Invalid format. Use: <word_index> <content> or 'ETIRW'\n");
+            free(line);
+            continue;
+        }
+        
+        // Send word update to Storage Server
+        memset(&request, 0, sizeof(request));
+        request.magic = PROTOCOL_MAGIC;
+        request.command = CMD_WRITE;
+        strncpy(request.username, username, sizeof(request.username) - 1);
+        snprintf(request.args, sizeof(request.args), "%d %s", word_index, content);
+        request.checksum = calculate_checksum(&request, sizeof(request) - sizeof(uint32_t));
+        
+        if (send_packet(ss_socket, &request) < 0) {
+            printf("Error: Failed to send word update\n");
+            free(line);
+            break;
+        }
+        
+        // Receive response
+        if (recv_packet(ss_socket, &response) <= 0) {
+            printf("Error: Failed to receive update response\n");
+            free(line);
+            break;
+        }
+        
+        if (response.status == STATUS_OK) {
+            printf("Word %d updated\n", word_index);
+        } else {
+            printf("Error: %s\n", response.data);
+        }
+        
+        free(line);
+    }
+    
+    close(ss_socket);
 }
 
 void handle_delete_command(command_t cmd, const char* args) {
@@ -479,9 +773,161 @@ void handle_info_command(command_t cmd, const char* args) {
     }
 }
 
+// Phase 5.2: Handle STREAM command - like READ but stream word-by-word
 void handle_stream_command(command_t cmd, const char* args) { 
     (void)cmd;
-    printf("STREAM command not yet implemented. Args: %s\n", args ? args : "none"); 
+    
+    // Parse filename from args
+    char filename[MAX_FILENAME_LEN];
+    if (args == NULL || strlen(args) == 0) {
+        printf("Error: No filename specified\n");
+        printf("Usage: STREAM <filename>\n");
+        return;
+    }
+    
+    sscanf(args, "%s", filename);
+    
+    // Step 1: Ask Name Server for storage server location
+    request_packet_t request;
+    memset(&request, 0, sizeof(request));
+    request.magic = PROTOCOL_MAGIC;
+    request.command = CMD_STREAM;
+    strncpy(request.username, username, sizeof(request.username) - 1);
+    strncpy(request.args, filename, sizeof(request.args) - 1);
+    request.checksum = calculate_checksum(&request, sizeof(request) - sizeof(uint32_t));
+    
+    if (send_packet(nm_socket, &request) < 0) {
+        printf("Error: Failed to send STREAM request to Name Server\n");
+        return;
+    }
+    
+    // Step 2: Get response from Name Server
+    response_packet_t response;
+    if (recv_packet(nm_socket, &response) <= 0) {
+        printf("Error: No response from Name Server\n");
+        return;
+    }
+    
+    if (response.status != STATUS_OK) {
+        printf("Error: %s\n", response.data);
+        return;
+    }
+    
+    // Step 3: Parse Storage Server location (format: "IP:PORT")
+    char ss_ip[INET_ADDRSTRLEN];
+    int ss_port;
+    if (sscanf(response.data, "%[^:]:%d", ss_ip, &ss_port) != 2) {
+        printf("Error: Invalid storage server location: %s\n", response.data);
+        return;
+    }
+    
+    printf("Streaming from Storage Server at %s:%d...\n", ss_ip, ss_port);
+    
+    // Step 4: Connect to Storage Server
+    int ss_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (ss_socket == -1) {
+        printf("Error: Failed to create socket\n");
+        return;
+    }
+    
+    struct sockaddr_in ss_addr;
+    memset(&ss_addr, 0, sizeof(ss_addr));
+    ss_addr.sin_family = AF_INET;
+    ss_addr.sin_port = htons(ss_port);
+    
+    if (inet_pton(AF_INET, ss_ip, &ss_addr.sin_addr) <= 0) {
+        printf("Error: Invalid storage server address\n");
+        close(ss_socket);
+        return;
+    }
+    
+    if (connect(ss_socket, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) == -1) {
+        printf("Error: Failed to connect to storage server: %s\n", strerror(errno));
+        close(ss_socket);
+        return;
+    }
+    
+    // Step 5: Send STREAM request to Storage Server
+    memset(&request, 0, sizeof(request));
+    request.magic = PROTOCOL_MAGIC;
+    request.command = CMD_STREAM;
+    strncpy(request.username, username, sizeof(request.username) - 1);
+    strncpy(request.args, filename, sizeof(request.args) - 1);
+    request.checksum = calculate_checksum(&request, sizeof(request) - sizeof(uint32_t));
+    
+    if (send_packet(ss_socket, &request) < 0) {
+        printf("Error: Failed to send STREAM request to storage server\n");
+        close(ss_socket);
+        return;
+    }
+    
+    // Step 6: Stream file content word-by-word with delay
+    printf("\n--- Streaming: %s ---\n", filename);
+    char buffer[4096];
+    ssize_t bytes;
+    char accumulated[8192] = "";
+    int acc_len = 0;
+    
+    while ((bytes = recv(ss_socket, buffer, sizeof(buffer) - 1, 0)) > 0) {
+        buffer[bytes] = '\0';
+        
+        // Accumulate data
+        if (acc_len + bytes < (int)sizeof(accumulated) - 1) {
+            strncat(accumulated, buffer, bytes);
+            acc_len += bytes;
+        }
+        
+        // Process accumulated buffer word by word
+        char* word = strtok(accumulated, " \t\n\r");
+        char remaining[8192] = "";
+        int first = 1;
+        
+        while (word != NULL) {
+            char* next = strtok(NULL, " \t\n\r");
+            
+            if (next == NULL) {
+                // This might be incomplete word, save for next iteration
+                if (bytes > 0) {
+                    strncpy(remaining, word, sizeof(remaining) - 1);
+                } else {
+                    // Last word in stream
+                    printf("%s ", word);
+                    fflush(stdout);
+                    usleep(100000);  // 0.1 second delay
+                }
+                break;
+            }
+            
+            // Print word with delay
+            if (!first) {
+                printf("%s ", word);
+            } else {
+                printf("%s ", word);
+                first = 0;
+            }
+            fflush(stdout);
+            usleep(100000);  // 0.1 second delay per word
+            
+            word = next;
+        }
+        
+        // Keep remaining partial word for next buffer
+        strncpy(accumulated, remaining, sizeof(accumulated) - 1);
+        acc_len = strlen(accumulated);
+    }
+    
+    // Print any remaining accumulated data
+    if (acc_len > 0) {
+        printf("%s", accumulated);
+    }
+    
+    if (bytes < 0) {
+        printf("\nError: Failed to stream from storage server\n");
+    } else {
+        printf("\n--- End of Stream ---\n");
+    }
+    
+    close(ss_socket);
 }
 
 // Phase 4: Handle LIST command
@@ -571,12 +1017,80 @@ void handle_access_command(command_t cmd, const char* args) {
 
 void handle_exec_command(command_t cmd, const char* args) { 
     (void)cmd;
-    printf("EXEC command not yet implemented. Args: %s\n", args ? args : "none"); 
+    
+    // Parse filename from args
+    char filename[MAX_FILENAME_LEN];
+    if (args == NULL || sscanf(args, "%s", filename) != 1) {
+        printf("Error: EXEC requires a filename\n");
+        printf("Usage: EXEC <filename>\n");
+        return;
+    }
+    
+    // Send EXEC request to Name Server
+    request_packet_t request;
+    memset(&request, 0, sizeof(request));
+    request.magic = PROTOCOL_MAGIC;
+    request.command = CMD_EXEC;
+    strncpy(request.username, username, sizeof(request.username) - 1);
+    strncpy(request.args, filename, sizeof(request.args) - 1);
+    request.checksum = calculate_checksum(&request, sizeof(request) - sizeof(uint32_t));
+    
+    if (send_packet(nm_socket, &request) < 0) {
+        printf("Error: Failed to send EXEC request\n");
+        return;
+    }
+    
+    // Receive response from Name Server
+    response_packet_t response;
+    if (recv_packet(nm_socket, &response) <= 0) {
+        printf("Error: Failed to receive response from name server\n");
+        return;
+    }
+    
+    if (response.status == STATUS_OK) {
+        printf("\n--- EXEC Output ---\n%s\n", response.data);
+    } else {
+        printf("Error: %s\n", response.data);
+    }
 }
 
 void handle_undo_command(command_t cmd, const char* args) { 
     (void)cmd;
-    printf("UNDO command not yet implemented. Args: %s\n", args ? args : "none"); 
+    
+    // Parse filename from args
+    char filename[MAX_FILENAME_LEN];
+    if (args == NULL || sscanf(args, "%s", filename) != 1) {
+        printf("Error: UNDO requires a filename\n");
+        printf("Usage: UNDO <filename>\n");
+        return;
+    }
+    
+    // Send UNDO request to Name Server
+    request_packet_t request;
+    memset(&request, 0, sizeof(request));
+    request.magic = PROTOCOL_MAGIC;
+    request.command = CMD_UNDO;
+    strncpy(request.username, username, sizeof(request.username) - 1);
+    strncpy(request.args, filename, sizeof(request.args) - 1);
+    request.checksum = calculate_checksum(&request, sizeof(request) - sizeof(uint32_t));
+    
+    if (send_packet(nm_socket, &request) < 0) {
+        printf("Error: Failed to send UNDO request\n");
+        return;
+    }
+    
+    // Receive response from Name Server
+    response_packet_t response;
+    if (recv_packet(nm_socket, &response) <= 0) {
+        printf("Error: Failed to receive response from name server\n");
+        return;
+    }
+    
+    if (response.status == STATUS_OK) {
+        printf("File '%s' restored from backup\n", filename);
+    } else {
+        printf("Error: %s\n", response.data);
+    }
 }
 
 // Phase 2: Send CLIENT_INIT packet to Name Server

@@ -27,6 +27,10 @@ static int client_server_socket = -1;
 static char discovered_files[MAX_FILES_PER_SERVER][MAX_FILENAME_LEN];
 static int discovered_file_count = 0;
 
+// Phase 5.3: Sentence-level locking for WRITE operations
+static sentence_lock_t* global_lock_list = NULL;
+static pthread_mutex_t lock_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // Function prototypes
 void register_with_name_server();
 void initialize_storage_server(const char* path, int c_port);
@@ -47,7 +51,19 @@ void send_ss_init_packet();
 // Phase 3: File operation handlers
 void handle_create_request(request_packet_t* req);
 void handle_delete_request(request_packet_t* req);
+void handle_update_acl_request(request_packet_t* req);
 int create_file_metadata(const char* filename, const char* owner);
+
+// ACL helpers
+char* serialize_acl_from_meta(const file_metadata_t* meta);
+int parse_acl_into_meta(file_metadata_t* meta, const char* acl_str);
+
+// Phase 5.3: Sentence lock management
+int acquire_lock(const char* file, int index, const char* user);
+void release_lock(const char* file, int index, const char* user);
+
+// Phase 5.1: Thread-based client handler
+void* client_connection_thread(void* arg);
 
 int main(int argc, char* argv[]) {
     if (argc != 5) {
@@ -121,10 +137,21 @@ int main(int argc, char* argv[]) {
                 LOG_INFO_MSG("STORAGE_SERVER", "New client connection from %s:%d",
                             inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
                 
-                // Handle client in a separate thread or process
-                // For now, handle synchronously
-                handle_client_connections();
-                close(client_socket);
+                // Phase 5.1: Spawn a detached thread to handle this client
+                int* sock_ptr = malloc(sizeof(int));
+                if (sock_ptr == NULL) {
+                    LOG_ERROR_MSG("STORAGE_SERVER", "Failed to allocate memory for client socket");
+                    close(client_socket);
+                } else {
+                    *sock_ptr = client_socket;
+                    pthread_t tid;
+                    if (pthread_create(&tid, NULL, client_connection_thread, (void*)sock_ptr) != 0) {
+                        LOG_ERROR_MSG("STORAGE_SERVER", "Failed to create thread for client");
+                        free(sock_ptr);
+                        close(client_socket);
+                    }
+                    // Thread created successfully; it will handle the client
+                }
             }
         }
     }
@@ -256,6 +283,90 @@ void handle_nm_commands() {
         case CMD_DELETE:
             handle_delete_request(&request);
             break;
+        case CMD_UPDATE_ACL:
+            handle_update_acl_request(&request);
+            break;
+        case CMD_READ:
+            // Phase 5.4: Handle READ request from Name Server (for EXEC)
+            // This is different from client CMD_READ - NM has already checked permissions
+            {
+                char filename[MAX_FILENAME_LEN];
+                sscanf(request.args, "%s", filename);
+                
+                char filepath[MAX_PATH_LEN];
+                snprintf(filepath, sizeof(filepath), "%s/%s", storage_path, filename);
+                
+                response_packet_t response;
+                memset(&response, 0, sizeof(response));
+                response.magic = PROTOCOL_MAGIC;
+                
+                // Open and read the file
+                FILE* fp = fopen(filepath, "r");
+                if (fp == NULL) {
+                    response.status = STATUS_ERROR_NOT_FOUND;
+                    snprintf(response.data, sizeof(response.data),
+                            "File not found: %s", filename);
+                    LOG_ERROR_MSG("STORAGE_SERVER", "NM requested file not found: %s", filename);
+                } else {
+                    // Read entire file content into response.data
+                    size_t bytes_read = fread(response.data, 1, 
+                                             sizeof(response.data) - 1, fp);
+                    response.data[bytes_read] = '\0';
+                    fclose(fp);
+                    
+                    response.status = STATUS_OK;
+                    LOG_INFO_MSG("STORAGE_SERVER", 
+                                "Sent file '%s' content to NM (%zu bytes)", 
+                                filename, bytes_read);
+                }
+                
+                response.checksum = calculate_checksum(&response,
+                                                       sizeof(response) - sizeof(uint32_t));
+                send_response(nm_socket, &response);
+            }
+            break;
+        case CMD_UNDO:
+            // Handle UNDO: restore file from backup
+            {
+                char filename[MAX_FILENAME_LEN];
+                sscanf(request.args, "%s", filename);
+                
+                char filepath[MAX_PATH_LEN];
+                char backup_filepath[MAX_PATH_LEN];
+                snprintf(filepath, sizeof(filepath), "%s/%s", storage_path, filename);
+                snprintf(backup_filepath, sizeof(backup_filepath), "%s/%s.bak", storage_path, filename);
+                
+                response_packet_t response;
+                memset(&response, 0, sizeof(response));
+                response.magic = PROTOCOL_MAGIC;
+                
+                // Check if backup exists
+                if (access(backup_filepath, F_OK) != 0) {
+                    response.status = STATUS_ERROR_NOT_FOUND;
+                    snprintf(response.data, sizeof(response.data), 
+                            "No backup found for '%s'", filename);
+                    LOG_WARNING_MSG("STORAGE_SERVER", "UNDO failed: no backup for '%s'", filename);
+                } else {
+                    // Rename backup to original file
+                    if (rename(backup_filepath, filepath) == 0) {
+                        response.status = STATUS_OK;
+                        snprintf(response.data, sizeof(response.data), 
+                                "File '%s' restored from backup", filename);
+                        LOG_INFO_MSG("STORAGE_SERVER", "UNDO successful: restored '%s'", filename);
+                    } else {
+                        response.status = STATUS_ERROR_INTERNAL;
+                        snprintf(response.data, sizeof(response.data), 
+                                "Failed to restore '%s': %s", filename, strerror(errno));
+                        LOG_ERROR_MSG("STORAGE_SERVER", "UNDO failed: rename error for '%s': %s",
+                                     filename, strerror(errno));
+                    }
+                }
+                
+                response.checksum = calculate_checksum(&response, 
+                                                       sizeof(response) - sizeof(uint32_t));
+                send_response(nm_socket, &response);
+            }
+            break;
         default:
             LOG_WARNING_MSG("STORAGE_SERVER", "Unknown command from NM: %d", request.command);
             
@@ -273,10 +384,568 @@ void handle_nm_commands() {
     }
 }
 
-void handle_client_connections() {
-    LOG_INFO_MSG("STORAGE_SERVER", "Handling client connection");
-    // TODO: Implement client connection handling
-    // READ, WRITE, STREAM operations
+// Phase 5.1: Thread handler for client connections
+void* client_connection_thread(void* arg) {
+    // Get the socket from the argument and free the allocated memory
+    int sock = *(int*)arg;
+    free(arg);
+    
+    // Make this thread detached so it cleans up automatically
+    pthread_detach(pthread_self());
+    
+    LOG_INFO_MSG("STORAGE_SERVER", "Client thread started for socket %d", sock);
+    
+    // Phase 5.3: Thread-local state for WRITE sessions
+    char* file_buffer = NULL;
+    char session_filename[MAX_FILENAME_LEN] = "";
+    int session_sentence = -1;
+    char session_user[MAX_USERNAME_LEN] = "";
+    
+    // Main client handling loop
+    while (1) {
+        request_packet_t request;
+        int bytes = recv_request(sock, &request);
+        
+        if (bytes <= 0) {
+            // Client disconnected or error
+            LOG_INFO_MSG("STORAGE_SERVER", "Client disconnected from socket %d", sock);
+            close(sock);
+            return NULL;
+        }
+        
+        // Validate packet integrity
+        if (!validate_packet_integrity(&request, sizeof(request))) {
+            LOG_ERROR_MSG("STORAGE_SERVER", "Received corrupted packet from client socket %d", sock);
+            continue;
+        }
+        
+        LOG_INFO_MSG("STORAGE_SERVER", "Received command %d from client socket %d", 
+                     request.command, sock);
+        
+        // Handle different client-facing commands
+        switch (request.command) {
+            case CMD_READ:
+                // Phase 5.2: Read file and send content to client
+                LOG_INFO_MSG("STORAGE_SERVER", "Processing READ request for '%s' by user '%s'",
+                            request.args, request.username);
+                {
+                    char filename[MAX_FILENAME_LEN];
+                    sscanf(request.args, "%s", filename);
+                    
+                    // Build file paths
+                    char filepath[MAX_PATH_LEN];
+                    char metapath[MAX_PATH_LEN];
+                    snprintf(filepath, sizeof(filepath), "%s/%s", storage_path, filename);
+                    snprintf(metapath, sizeof(metapath), "%s/%s.meta", storage_path, filename);
+                    
+                    // Check if .meta file exists and verify permissions
+                    FILE* meta_fp = fopen(metapath, "r");
+                    if (meta_fp == NULL) {
+                        LOG_ERROR_MSG("STORAGE_SERVER", "Metadata file not found: %s", metapath);
+                        response_packet_t response;
+                        memset(&response, 0, sizeof(response));
+                        response.magic = PROTOCOL_MAGIC;
+                        response.status = STATUS_ERROR_NOT_FOUND;
+                        snprintf(response.data, sizeof(response.data), 
+                                "File metadata not found");
+                        response.checksum = calculate_checksum(&response, 
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                        close(sock);
+                        return NULL;
+                    }
+                    
+                    // Parse metadata to check access permissions
+                    int has_access = 0;
+                    char owner[MAX_USERNAME_LEN] = "";
+                    char line[512];
+                    
+                    while (fgets(line, sizeof(line), meta_fp) != NULL) {
+                        if (strncmp(line, "owner=", 6) == 0) {
+                            sscanf(line + 6, "%s", owner);
+                            if (strcmp(owner, request.username) == 0) {
+                                has_access = 1;
+                            }
+                        } else if (strstr(line, "access_") == line) {
+                            // Parse ACL entry: access_N=user:PERM
+                            char acl_user[MAX_USERNAME_LEN];
+                            char perms[8];
+                            if (sscanf(line, "access_%*d=%[^:]:%s", acl_user, perms) == 2) {
+                                if (strcmp(acl_user, request.username) == 0) {
+                                    // Check if user has read permission
+                                    if (strchr(perms, 'R') != NULL) {
+                                        has_access = 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    fclose(meta_fp);
+                    
+                    if (!has_access) {
+                        LOG_WARNING_MSG("STORAGE_SERVER", "User '%s' denied read access to '%s'",
+                                       request.username, filename);
+                        response_packet_t response;
+                        memset(&response, 0, sizeof(response));
+                        response.magic = PROTOCOL_MAGIC;
+                        response.status = STATUS_ERROR_READ_PERMISSION;
+                        snprintf(response.data, sizeof(response.data), 
+                                "Permission denied");
+                        response.checksum = calculate_checksum(&response, 
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                        close(sock);
+                        return NULL;
+                    }
+                    
+                    // Open and read the file
+                    FILE* fp = fopen(filepath, "r");
+                    if (fp == NULL) {
+                        LOG_ERROR_MSG("STORAGE_SERVER", "Failed to open file: %s", filepath);
+                        response_packet_t response;
+                        memset(&response, 0, sizeof(response));
+                        response.magic = PROTOCOL_MAGIC;
+                        response.status = STATUS_ERROR_NOT_FOUND;
+                        snprintf(response.data, sizeof(response.data), 
+                                "File not found");
+                        response.checksum = calculate_checksum(&response, 
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                        close(sock);
+                        return NULL;
+                    }
+                    
+                    // Send file content in chunks
+                    char buffer[4096];
+                    size_t bytes_read;
+                    
+                    LOG_INFO_MSG("STORAGE_SERVER", "Sending file '%s' to client", filename);
+                    
+                    while ((bytes_read = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+                        ssize_t sent = send(sock, buffer, bytes_read, 0);
+                        if (sent < 0) {
+                            LOG_ERROR_MSG("STORAGE_SERVER", "Failed to send data to client");
+                            break;
+                        }
+                    }
+                    
+                    fclose(fp);
+                    close(sock);
+                    LOG_INFO_MSG("STORAGE_SERVER", "Finished sending file '%s'", filename);
+                    return NULL;
+                }
+                break;
+                
+            case CMD_WRITE:
+                // Phase 5.3: Stateful WRITE handler with locking
+                LOG_INFO_MSG("STORAGE_SERVER", "Processing WRITE request: '%s' by user '%s'",
+                            request.args, request.username);
+                {
+                    
+                    response_packet_t response;
+                    memset(&response, 0, sizeof(response));
+                    response.magic = PROTOCOL_MAGIC;
+                    
+                    // Check if this is initial WRITE or word update
+                    char filename[MAX_FILENAME_LEN];
+                    int sentence_num = -1;
+                    int word_index = -1;
+                    char word_content[MAX_WORD_LEN];
+                    
+                    // Try parsing as initial request (filename sentence_num)
+                    if (sscanf(request.args, "%s %d", filename, &sentence_num) == 2) {
+                        // This is initial WRITE request - acquire lock
+                        
+                        // Check if already have active session
+                        if (file_buffer != NULL) {
+                            response.status = STATUS_ERROR_INTERNAL;
+                            snprintf(response.data, sizeof(response.data),
+                                    "Session already active for %s", session_filename);
+                            response.checksum = calculate_checksum(&response,
+                                                                   sizeof(response) - sizeof(uint32_t));
+                            send_response(sock, &response);
+                            break;
+                        }
+                        
+                        // Build file paths
+                        char filepath[MAX_PATH_LEN];
+                        char metapath[MAX_PATH_LEN];
+                        snprintf(filepath, sizeof(filepath), "%s/%s", storage_path, filename);
+                        snprintf(metapath, sizeof(metapath), "%s/%s.meta", storage_path, filename);
+                        
+                        // Check metadata for write permissions
+                        FILE* meta_fp = fopen(metapath, "r");
+                        if (meta_fp == NULL) {
+                            response.status = STATUS_ERROR_NOT_FOUND;
+                            snprintf(response.data, sizeof(response.data),
+                                    "File metadata not found");
+                            response.checksum = calculate_checksum(&response,
+                                                                   sizeof(response) - sizeof(uint32_t));
+                            send_response(sock, &response);
+                            break;
+                        }
+                        
+                        int has_write_access = 0;
+                        char owner[MAX_USERNAME_LEN] = "";
+                        char line[512];
+                        
+                        while (fgets(line, sizeof(line), meta_fp) != NULL) {
+                            if (strncmp(line, "owner=", 6) == 0) {
+                                sscanf(line + 6, "%s", owner);
+                                if (strcmp(owner, request.username) == 0) {
+                                    has_write_access = 1;
+                                }
+                            } else if (strstr(line, "access_") == line) {
+                                char acl_user[MAX_USERNAME_LEN];
+                                char perms[8];
+                                if (sscanf(line, "access_%*d=%[^:]:%s", acl_user, perms) == 2) {
+                                    if (strcmp(acl_user, request.username) == 0) {
+                                        if (strchr(perms, 'W') != NULL) {
+                                            has_write_access = 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        fclose(meta_fp);
+                        
+                        if (!has_write_access) {
+                            response.status = STATUS_ERROR_WRITE_PERMISSION;
+                            snprintf(response.data, sizeof(response.data),
+                                    "Permission denied");
+                            response.checksum = calculate_checksum(&response,
+                                                                   sizeof(response) - sizeof(uint32_t));
+                            send_response(sock, &response);
+                            LOG_WARNING_MSG("STORAGE_SERVER", "User '%s' denied write access to '%s'",
+                                           request.username, filename);
+                            break;
+                        }
+                        
+                        // Try to acquire lock
+                        if (!acquire_lock(filename, sentence_num, request.username)) {
+                            response.status = STATUS_ERROR_LOCKED;
+                            snprintf(response.data, sizeof(response.data),
+                                    "Sentence %d is locked by another user", sentence_num);
+                            response.checksum = calculate_checksum(&response,
+                                                                   sizeof(response) - sizeof(uint32_t));
+                            send_response(sock, &response);
+                            LOG_WARNING_MSG("STORAGE_SERVER", "Lock denied for '%s' sentence %d",
+                                           filename, sentence_num);
+                            break;
+                        }
+                        
+                        // Load file into memory
+                        FILE* fp = fopen(filepath, "r");
+                        if (fp == NULL) {
+                            release_lock(filename, sentence_num, request.username);
+                            response.status = STATUS_ERROR_NOT_FOUND;
+                            snprintf(response.data, sizeof(response.data),
+                                    "File not found");
+                            response.checksum = calculate_checksum(&response,
+                                                                   sizeof(response) - sizeof(uint32_t));
+                            send_response(sock, &response);
+                            break;
+                        }
+                        
+                        // Get file size
+                        fseek(fp, 0, SEEK_END);
+                        long file_size = ftell(fp);
+                        fseek(fp, 0, SEEK_SET);
+                        
+                        // Allocate buffer and read file
+                        file_buffer = (char*)malloc(file_size + 1);
+                        if (file_buffer == NULL) {
+                            fclose(fp);
+                            release_lock(filename, sentence_num, request.username);
+                            response.status = STATUS_ERROR_INTERNAL;
+                            snprintf(response.data, sizeof(response.data),
+                                    "Memory allocation failed");
+                            response.checksum = calculate_checksum(&response,
+                                                                   sizeof(response) - sizeof(uint32_t));
+                            send_response(sock, &response);
+                            break;
+                        }
+                        
+                        size_t bytes_read = fread(file_buffer, 1, file_size, fp);
+                        file_buffer[bytes_read] = '\0';
+                        fclose(fp);
+                        
+                        // Store session info
+                        strncpy(session_filename, filename, MAX_FILENAME_LEN - 1);
+                        session_sentence = sentence_num;
+                        strncpy(session_user, request.username, MAX_USERNAME_LEN - 1);
+                        
+                        // Send success response
+                        response.status = STATUS_OK;
+                        snprintf(response.data, sizeof(response.data),
+                                "Lock acquired for sentence %d", sentence_num);
+                        response.checksum = calculate_checksum(&response,
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                        
+                        LOG_INFO_MSG("STORAGE_SERVER", "WRITE session started: '%s' sentence %d by '%s'",
+                                    filename, sentence_num, request.username);
+                        
+                    } else if (sscanf(request.args, "%d %s", &word_index, word_content) == 2) {
+                        // This is word update request
+                        
+                        if (file_buffer == NULL) {
+                            response.status = STATUS_ERROR_INTERNAL;
+                            snprintf(response.data, sizeof(response.data),
+                                    "No active WRITE session");
+                            response.checksum = calculate_checksum(&response,
+                                                                   sizeof(response) - sizeof(uint32_t));
+                            send_response(sock, &response);
+                            break;
+                        }
+                        
+                        // TODO: Update word in file_buffer using file_ops functions
+                        // For now, just acknowledge the update
+                        response.status = STATUS_OK;
+                        snprintf(response.data, sizeof(response.data),
+                                "Word %d updated to '%s'", word_index, word_content);
+                        response.checksum = calculate_checksum(&response,
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                        
+                        LOG_INFO_MSG("STORAGE_SERVER", "Word %d updated in '%s'",
+                                    word_index, session_filename);
+                        
+                    } else {
+                        response.status = STATUS_ERROR_INVALID_OPERATION;
+                        snprintf(response.data, sizeof(response.data),
+                                "Invalid WRITE args format");
+                        response.checksum = calculate_checksum(&response,
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                    }
+                }
+                break;
+                
+            case CMD_ETIRW:
+                // Phase 5.3: Finalize WRITE session
+                LOG_INFO_MSG("STORAGE_SERVER", "Processing ETIRW request");
+                {
+                    response_packet_t response;
+                    memset(&response, 0, sizeof(response));
+                    response.magic = PROTOCOL_MAGIC;
+                    
+                    if (file_buffer == NULL) {
+                        response.status = STATUS_ERROR_INTERNAL;
+                        snprintf(response.data, sizeof(response.data),
+                                "No active WRITE session");
+                        response.checksum = calculate_checksum(&response,
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                        break;
+                    }
+                    
+                    // Build file paths
+                    char filepath[MAX_PATH_LEN];
+                    char backup_path[MAX_PATH_LEN];
+                    snprintf(filepath, sizeof(filepath), "%s/%s", storage_path, session_filename);
+                    snprintf(backup_path, sizeof(backup_path), "%s/%s.bak", storage_path, session_filename);
+                    
+                    // Create backup
+                    if (rename(filepath, backup_path) != 0) {
+                        response.status = STATUS_ERROR_INTERNAL;
+                        snprintf(response.data, sizeof(response.data),
+                                "Failed to create backup: %s", strerror(errno));
+                        response.checksum = calculate_checksum(&response,
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                        LOG_ERROR_MSG("STORAGE_SERVER", "Backup creation failed for '%s'",
+                                     session_filename);
+                        break;
+                    }
+                    
+                    // Write buffer to file
+                    FILE* fp = fopen(filepath, "w");
+                    if (fp == NULL) {
+                        // Restore from backup
+                        rename(backup_path, filepath);
+                        response.status = STATUS_ERROR_INTERNAL;
+                        snprintf(response.data, sizeof(response.data),
+                                "Failed to open file for writing");
+                        response.checksum = calculate_checksum(&response,
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                        break;
+                    }
+                    
+                    size_t written = fwrite(file_buffer, 1, strlen(file_buffer), fp);
+                    fclose(fp);
+                    
+                    if (written != strlen(file_buffer)) {
+                        // Restore from backup
+                        rename(backup_path, filepath);
+                        response.status = STATUS_ERROR_INTERNAL;
+                        snprintf(response.data, sizeof(response.data),
+                                "Failed to write file completely");
+                        response.checksum = calculate_checksum(&response,
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                        break;
+                    }
+                    
+                    // Release lock
+                    release_lock(session_filename, session_sentence, session_user);
+                    
+                    // Free buffer and reset session
+                    free(file_buffer);
+                    file_buffer = NULL;
+                    session_filename[0] = '\0';
+                    session_sentence = -1;
+                    session_user[0] = '\0';
+                    
+                    // Send success response
+                    response.status = STATUS_OK;
+                    snprintf(response.data, sizeof(response.data),
+                            "File saved successfully");
+                    response.checksum = calculate_checksum(&response,
+                                                           sizeof(response) - sizeof(uint32_t));
+                    send_response(sock, &response);
+                    
+                    LOG_INFO_MSG("STORAGE_SERVER", "ETIRW completed for '%s'",
+                                filepath);
+                    
+                    // Close connection after ETIRW
+                    close(sock);
+                    return NULL;
+                }
+                break;
+                
+            case CMD_STREAM:
+                // Phase 5.2: Stream file (same as READ, permissions checked from .meta)
+                LOG_INFO_MSG("STORAGE_SERVER", "Processing STREAM request for '%s' by user '%s'",
+                            request.args, request.username);
+                {
+                    char filename[MAX_FILENAME_LEN];
+                    sscanf(request.args, "%s", filename);
+                    
+                    // Build file paths
+                    char filepath[MAX_PATH_LEN];
+                    char metapath[MAX_PATH_LEN];
+                    snprintf(filepath, sizeof(filepath), "%s/%s", storage_path, filename);
+                    snprintf(metapath, sizeof(metapath), "%s/%s.meta", storage_path, filename);
+                    
+                    // Check if .meta file exists and verify permissions
+                    FILE* meta_fp = fopen(metapath, "r");
+                    if (meta_fp == NULL) {
+                        LOG_ERROR_MSG("STORAGE_SERVER", "Metadata file not found: %s", metapath);
+                        response_packet_t response;
+                        memset(&response, 0, sizeof(response));
+                        response.magic = PROTOCOL_MAGIC;
+                        response.status = STATUS_ERROR_NOT_FOUND;
+                        snprintf(response.data, sizeof(response.data), 
+                                "File metadata not found");
+                        response.checksum = calculate_checksum(&response, 
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                        close(sock);
+                        return NULL;
+                    }
+                    
+                    // Parse metadata to check access permissions
+                    int has_access = 0;
+                    char owner[MAX_USERNAME_LEN] = "";
+                    char line[512];
+                    
+                    while (fgets(line, sizeof(line), meta_fp) != NULL) {
+                        if (strncmp(line, "owner=", 6) == 0) {
+                            sscanf(line + 6, "%s", owner);
+                            if (strcmp(owner, request.username) == 0) {
+                                has_access = 1;
+                            }
+                        } else if (strstr(line, "access_") == line) {
+                            // Parse ACL entry: access_N=user:PERM
+                            char acl_user[MAX_USERNAME_LEN];
+                            char perms[8];
+                            if (sscanf(line, "access_%*d=%[^:]:%s", acl_user, perms) == 2) {
+                                if (strcmp(acl_user, request.username) == 0) {
+                                    // Check if user has read permission
+                                    if (strchr(perms, 'R') != NULL) {
+                                        has_access = 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    fclose(meta_fp);
+                    
+                    if (!has_access) {
+                        LOG_WARNING_MSG("STORAGE_SERVER", "User '%s' denied stream access to '%s'",
+                                       request.username, filename);
+                        response_packet_t response;
+                        memset(&response, 0, sizeof(response));
+                        response.magic = PROTOCOL_MAGIC;
+                        response.status = STATUS_ERROR_READ_PERMISSION;
+                        snprintf(response.data, sizeof(response.data), 
+                                "Permission denied");
+                        response.checksum = calculate_checksum(&response, 
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                        close(sock);
+                        return NULL;
+                    }
+                    
+                    // Open and stream the file
+                    FILE* fp = fopen(filepath, "r");
+                    if (fp == NULL) {
+                        LOG_ERROR_MSG("STORAGE_SERVER", "Failed to open file: %s", filepath);
+                        response_packet_t response;
+                        memset(&response, 0, sizeof(response));
+                        response.magic = PROTOCOL_MAGIC;
+                        response.status = STATUS_ERROR_NOT_FOUND;
+                        snprintf(response.data, sizeof(response.data), 
+                                "File not found");
+                        response.checksum = calculate_checksum(&response, 
+                                                               sizeof(response) - sizeof(uint32_t));
+                        send_response(sock, &response);
+                        close(sock);
+                        return NULL;
+                    }
+                    
+                    // Send file content in chunks (same as READ)
+                    char buffer[4096];
+                    size_t bytes_read;
+                    
+                    LOG_INFO_MSG("STORAGE_SERVER", "Streaming file '%s' to client", filename);
+                    
+                    while ((bytes_read = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+                        ssize_t sent = send(sock, buffer, bytes_read, 0);
+                        if (sent < 0) {
+                            LOG_ERROR_MSG("STORAGE_SERVER", "Failed to send data to client");
+                            break;
+                        }
+                    }
+                    
+                    fclose(fp);
+                    close(sock);
+                    LOG_INFO_MSG("STORAGE_SERVER", "Finished streaming file '%s'", filename);
+                    return NULL;
+                }
+                break;
+                
+            default:
+                LOG_WARNING_MSG("STORAGE_SERVER", "Unknown command %d from client socket %d", 
+                               request.command, sock);
+                {
+                    response_packet_t error_response;
+                    memset(&error_response, 0, sizeof(error_response));
+                    error_response.magic = PROTOCOL_MAGIC;
+                    error_response.status = STATUS_ERROR_INVALID_OPERATION;
+                    snprintf(error_response.data, sizeof(error_response.data), 
+                            "Unknown command: %d", request.command);
+                    error_response.checksum = calculate_checksum(&error_response, 
+                                                                 sizeof(error_response) - sizeof(uint32_t));
+                    send_response(sock, &error_response);
+                }
+                break;
+        }
+    }
+    
+    return NULL;
 }
 
 void stream_file_to_client(int client_socket, const char* filename) {
@@ -607,4 +1276,313 @@ int create_file_metadata(const char* filename, const char* owner) {
     LOG_INFO_MSG("STORAGE_SERVER", "Created metadata file: %s", metapath);
     
     return 0;
+}
+
+// Serialize ACL from metadata into a compact string: "user1:RW,user2:R"
+char* serialize_acl_from_meta(const file_metadata_t* meta) {
+    if (meta == NULL) return NULL;
+    // Allocate buffer on heap; caller must free
+    size_t buf_sz = MAX_ARGS_LEN;
+    char* buf = (char*)calloc(1, buf_sz);
+    if (!buf) return NULL;
+
+    size_t offset = 0;
+    for (int i = 0; i < meta->access_count; i++) {
+        const char* user = meta->access_list[i];
+        int perms = meta->access_permissions[i];
+        char perm_str[4] = "";
+        if ((perms & ACCESS_READ) && (perms & ACCESS_WRITE)) {
+            strcpy(perm_str, "RW");
+        } else if (perms & ACCESS_READ) {
+            strcpy(perm_str, "R");
+        } else if (perms & ACCESS_WRITE) {
+            strcpy(perm_str, "RW"); // write implies read
+        } else {
+            strcpy(perm_str, "-");
+        }
+
+        int written = snprintf(buf + offset, buf_sz - offset, "%s:%s", user, perm_str);
+        if (written < 0 || (size_t)written >= buf_sz - offset) {
+            // buffer full
+            break;
+        }
+        offset += written;
+        if (i < meta->access_count - 1) {
+            if (offset < buf_sz - 1) {
+                buf[offset++] = ',';
+                buf[offset] = '\0';
+            }
+        }
+    }
+
+    return buf;
+}
+
+// Parse acl string "user1:RW,user2:R" into metadata acl arrays
+int parse_acl_into_meta(file_metadata_t* meta, const char* acl_str) {
+    if (meta == NULL || acl_str == NULL) return -1;
+
+    // Reset existing ACLs
+    meta->access_count = 0;
+
+    char buf[MAX_ARGS_LEN];
+    strncpy(buf, acl_str, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char* saveptr1 = NULL;
+    char* token = strtok_r(buf, ",", &saveptr1);
+    while (token != NULL && meta->access_count < MAX_CLIENTS) {
+        // token format: user:PERM
+        char* colon = strchr(token, ':');
+        if (colon == NULL) {
+            token = strtok_r(NULL, ",", &saveptr1);
+            continue;
+        }
+        *colon = '\0';
+        const char* user = token;
+        const char* perms = colon + 1;
+
+        strncpy(meta->access_list[meta->access_count], user, MAX_USERNAME_LEN - 1);
+        meta->access_list[meta->access_count][MAX_USERNAME_LEN - 1] = '\0';
+
+        int perm_bits = ACCESS_NONE;
+        if (strstr(perms, "R") != NULL) perm_bits |= ACCESS_READ;
+        if (strstr(perms, "W") != NULL) perm_bits |= ACCESS_WRITE;
+        if (perm_bits == ACCESS_NONE && strcmp(perms, "-") == 0) {
+            perm_bits = ACCESS_NONE;
+        }
+        // write implies read
+        if ((perm_bits & ACCESS_WRITE) && !(perm_bits & ACCESS_READ)) {
+            perm_bits |= ACCESS_READ;
+        }
+
+        meta->access_permissions[meta->access_count] = perm_bits;
+        meta->access_count++;
+
+        token = strtok_r(NULL, ",", &saveptr1);
+    }
+
+    return 0;
+}
+
+// Handle CMD_UPDATE_ACL from Name Server: args = "<filename> <acl_string>"
+void handle_update_acl_request(request_packet_t* req) {
+    LOG_INFO_MSG("STORAGE_SERVER", "Handling UPDATE_ACL request from NM: %s by %s", req->args, req->username);
+
+    response_packet_t response;
+    memset(&response, 0, sizeof(response));
+    response.magic = PROTOCOL_MAGIC;
+
+    // Parse filename and acl string
+    char args_copy[MAX_ARGS_LEN];
+    strncpy(args_copy, req->args, sizeof(args_copy) - 1);
+    args_copy[sizeof(args_copy) - 1] = '\0';
+
+    char* first_space = strchr(args_copy, ' ');
+    if (first_space == NULL) {
+        response.status = STATUS_ERROR_INVALID_ARGS;
+        snprintf(response.data, sizeof(response.data), "Invalid args for UPDATE_ACL");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(nm_socket, &response);
+        return;
+    }
+
+    *first_space = '\0';
+    char* filename = args_copy;
+    char* acl_str = first_space + 1;
+
+    // Build meta path
+    char metapath[MAX_PATH_LEN];
+    snprintf(metapath, sizeof(metapath), "%s/%s.meta", storage_path, filename);
+
+    // Check meta exists
+    if (access(metapath, F_OK) != 0) {
+        response.status = STATUS_ERROR_NOT_FOUND;
+        snprintf(response.data, sizeof(response.data), "Metadata for '%s' not found", filename);
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(nm_socket, &response);
+        return;
+    }
+
+    // Read current metadata fields (non-ACL) to preserve them
+    char owner[MAX_USERNAME_LEN] = "";
+    long created = 0, modified = 0, accessed = 0;
+    char accessed_by[MAX_USERNAME_LEN] = "";
+    size_t size_val = 0;
+    int word_count = 0, char_count = 0;
+
+    FILE* mf = fopen(metapath, "r");
+    if (mf != NULL) {
+        char line[512];
+        while (fgets(line, sizeof(line), mf) != NULL) {
+            if (strncmp(line, "owner=", 6) == 0) {
+                sscanf(line + 6, "%63s", owner);
+            } else if (strncmp(line, "created=", 8) == 0) {
+                sscanf(line + 8, "%ld", &created);
+            } else if (strncmp(line, "modified=", 9) == 0) {
+                sscanf(line + 9, "%ld", &modified);
+            } else if (strncmp(line, "accessed=", 9) == 0) {
+                sscanf(line + 9, "%ld", &accessed);
+            } else if (strncmp(line, "accessed_by=", 12) == 0) {
+                sscanf(line + 12, "%63s", accessed_by);
+            } else if (strncmp(line, "size=", 5) == 0) {
+                sscanf(line + 5, "%zu", &size_val);
+            } else if (strncmp(line, "word_count=", 11) == 0) {
+                sscanf(line + 11, "%d", &word_count);
+            } else if (strncmp(line, "char_count=", 11) == 0) {
+                sscanf(line + 11, "%d", &char_count);
+            }
+        }
+        fclose(mf);
+    }
+
+    // Parse the new ACL into a metadata struct
+    file_metadata_t tmp_meta;
+    memset(&tmp_meta, 0, sizeof(tmp_meta));
+    // Keep owner in metadata too
+    if (strlen(owner) > 0) strncpy(tmp_meta.owner, owner, sizeof(tmp_meta.owner) - 1);
+    parse_acl_into_meta(&tmp_meta, acl_str);
+
+    // Write the metadata file (overwrite)
+    FILE* out = fopen(metapath, "w");
+    if (out == NULL) {
+        LOG_ERROR_MSG("STORAGE_SERVER", "Failed to open metadata for writing: %s", metapath);
+        response.status = STATUS_ERROR_INTERNAL;
+        snprintf(response.data, sizeof(response.data), "Failed to write metadata");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(nm_socket, &response);
+        return;
+    }
+
+    fprintf(out, "owner=%s\n", owner);
+    fprintf(out, "created=%ld\n", created > 0 ? created : time(NULL));
+    fprintf(out, "modified=%ld\n", time(NULL));
+    fprintf(out, "accessed=%ld\n", accessed > 0 ? accessed : time(NULL));
+    fprintf(out, "accessed_by=%s\n", accessed_by[0] ? accessed_by : owner);
+    fprintf(out, "size=%zu\n", size_val);
+    fprintf(out, "word_count=%d\n", word_count);
+    fprintf(out, "char_count=%d\n", char_count);
+    fprintf(out, "access_count=%d\n", tmp_meta.access_count);
+    for (int i = 0; i < tmp_meta.access_count; i++) {
+        int p = tmp_meta.access_permissions[i];
+        if ((p & ACCESS_READ) && (p & ACCESS_WRITE)) {
+            fprintf(out, "access_%d=%s:RW\n", i, tmp_meta.access_list[i]);
+        } else if (p & ACCESS_READ) {
+            fprintf(out, "access_%d=%s:R\n", i, tmp_meta.access_list[i]);
+        } else if (p & ACCESS_WRITE) {
+            fprintf(out, "access_%d=%s:RW\n", i, tmp_meta.access_list[i]);
+        } else {
+            fprintf(out, "access_%d=%s:-\n", i, tmp_meta.access_list[i]);
+        }
+    }
+
+    fclose(out);
+
+    // Send success response back to Name Server
+    response.status = STATUS_OK;
+    snprintf(response.data, sizeof(response.data), "ACL updated on storage");
+    response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+    send_response(nm_socket, &response);
+
+    LOG_INFO_MSG("STORAGE_SERVER", "Updated ACL for file '%s' successfully", filename);
+}
+
+/*
+ * Phase 5.3: Sentence lock management functions
+ * These functions manage sentence-level locks for concurrent WRITE operations
+ */
+
+/**
+ * acquire_lock - Attempt to acquire a sentence lock for a file
+ * @file: The filename to lock
+ * @index: The sentence index to lock
+ * @user: The username acquiring the lock
+ *
+ * Returns: 1 if lock acquired, 0 if lock is already held by someone else
+ */
+int acquire_lock(const char* file, int index, const char* user) {
+    pthread_mutex_lock(&lock_list_mutex);
+    
+    // Check if lock already exists for this file and sentence
+    sentence_lock_t* current = global_lock_list;
+    while (current != NULL) {
+        if (strcmp(current->filename, file) == 0 && 
+            current->sentence_index == index) {
+            // Lock exists - check if it's held by a different user
+            if (strcmp(current->username, user) != 0) {
+                pthread_mutex_unlock(&lock_list_mutex);
+                LOG_INFO_MSG("STORAGE_SERVER", 
+                    "Lock denied: sentence %d of '%s' held by '%s'", 
+                    index, file, current->username);
+                return 0;  // Lock held by someone else
+            }
+            // Same user already holds the lock
+            pthread_mutex_unlock(&lock_list_mutex);
+            return 1;
+        }
+        current = current->next;
+    }
+    
+    // Lock is available - create new lock entry
+    sentence_lock_t* new_lock = (sentence_lock_t*)malloc(sizeof(sentence_lock_t));
+    if (new_lock == NULL) {
+        pthread_mutex_unlock(&lock_list_mutex);
+        LOG_ERROR_MSG("STORAGE_SERVER", "Failed to allocate memory for lock");
+        return 0;
+    }
+    
+    strncpy(new_lock->filename, file, MAX_FILENAME_LEN - 1);
+    new_lock->filename[MAX_FILENAME_LEN - 1] = '\0';
+    new_lock->sentence_index = index;
+    strncpy(new_lock->username, user, MAX_USERNAME_LEN - 1);
+    new_lock->username[MAX_USERNAME_LEN - 1] = '\0';
+    new_lock->next = global_lock_list;
+    global_lock_list = new_lock;
+    
+    pthread_mutex_unlock(&lock_list_mutex);
+    LOG_INFO_MSG("STORAGE_SERVER", 
+        "Lock acquired: sentence %d of '%s' by '%s'", 
+        index, file, user);
+    return 1;
+}
+
+/**
+ * release_lock - Release a sentence lock held by a user
+ * @file: The filename to unlock
+ * @index: The sentence index to unlock
+ * @user: The username releasing the lock
+ */
+void release_lock(const char* file, int index, const char* user) {
+    pthread_mutex_lock(&lock_list_mutex);
+    
+    sentence_lock_t* current = global_lock_list;
+    sentence_lock_t* prev = NULL;
+    
+    while (current != NULL) {
+        if (strcmp(current->filename, file) == 0 && 
+            current->sentence_index == index &&
+            strcmp(current->username, user) == 0) {
+            // Found the lock - remove it
+            if (prev == NULL) {
+                global_lock_list = current->next;
+            } else {
+                prev->next = current->next;
+            }
+            
+            LOG_INFO_MSG("STORAGE_SERVER", 
+                "Lock released: sentence %d of '%s' by '%s'", 
+                index, file, user);
+            free(current);
+            pthread_mutex_unlock(&lock_list_mutex);
+            return;
+        }
+        prev = current;
+        current = current->next;
+    }
+    
+    // Lock not found
+    pthread_mutex_unlock(&lock_list_mutex);
+    LOG_WARNING_MSG("STORAGE_SERVER", 
+        "Attempted to release non-existent lock: sentence %d of '%s' by '%s'", 
+        index, file, user);
 }

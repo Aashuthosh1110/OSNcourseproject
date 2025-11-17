@@ -107,6 +107,14 @@ typedef struct {
     int total_files;
 } file_hash_table_t;
 
+// Sentence lock structure for WRITE operations
+typedef struct sentence_lock {
+    char filename[MAX_FILENAME_LEN];
+    int sentence_index;
+    char username[MAX_USERNAME_LEN];
+    struct sentence_lock* next;
+} sentence_lock_t;
+
 // Function prototypes for common utilities
 void log_message(const char* level, const char* component, const char* message);
 char* get_timestamp();

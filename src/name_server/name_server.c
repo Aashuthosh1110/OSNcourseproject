@@ -10,6 +10,7 @@
 #include "../../include/errors.h"
 #include "../../include/nm_state.h"
 #include <signal.h>
+#include <sys/wait.h>
 
 // Global state - Phase 2: Use linked lists and hash table
 static ss_node_t* storage_servers_list = NULL;
@@ -46,6 +47,17 @@ void handle_info_file(int sockfd, request_packet_t* req);
 void handle_addaccess(int sockfd, request_packet_t* req);
 void handle_remaccess(int sockfd, request_packet_t* req);
 int check_user_has_access(file_hash_entry_t* entry, const char* username, int access_type);
+
+// Phase 5.2: File operation handlers
+void handle_read_file(int sockfd, request_packet_t* req);
+void handle_stream_file(int sockfd, request_packet_t* req);
+
+// Phase 5.3: Write and undo handlers
+void handle_write_file(int sockfd, request_packet_t* req);
+void handle_undo_file(int sockfd, request_packet_t* req);
+
+// Phase 5.4: Exec handler
+void handle_exec_command(int sockfd, request_packet_t* req);
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
@@ -305,6 +317,21 @@ void process_connection_data(int sockfd) {
             break;
         case CMD_DELETE:
             handle_delete_file(sockfd, &request);
+            break;
+        case CMD_READ:
+            handle_read_file(sockfd, &request);
+            break;
+        case CMD_STREAM:
+            handle_stream_file(sockfd, &request);
+            break;
+        case CMD_WRITE:
+            handle_write_file(sockfd, &request);
+            break;
+        case CMD_UNDO:
+            handle_undo_file(sockfd, &request);
+            break;
+        case CMD_EXEC:
+            handle_exec_command(sockfd, &request);
             break;
         case CMD_LIST:
             handle_list_users(sockfd, &request);
@@ -1018,6 +1045,10 @@ void handle_addaccess(int client_fd, request_packet_t* req) {
         return;
     }
     
+    // Snapshot old metadata for rollback
+    file_metadata_t old_meta;
+    memcpy(&old_meta, &file_entry->metadata, sizeof(file_metadata_t));
+
     // Find or create ACL entry
     int acl_index = -1;
     for (int i = 0; i < file_entry->metadata.access_count; i++) {
@@ -1048,12 +1079,70 @@ void handle_addaccess(int client_fd, request_packet_t* req) {
         file_entry->metadata.access_permissions[acl_index] |= ACCESS_WRITE;
         file_entry->metadata.access_permissions[acl_index] |= ACCESS_READ;  // Write implies read
     }
-    
+
+    // Serialize ACL to send to Storage Server
+    char acl_str[MAX_ARGS_LEN];
+    memset(acl_str, 0, sizeof(acl_str));
+    int off = 0;
+    for (int i = 0; i < file_entry->metadata.access_count && off < (int)sizeof(acl_str) - 50; i++) {
+        int p = file_entry->metadata.access_permissions[i];
+        const char* user = file_entry->metadata.access_list[i];
+        const char* perm_s = "-";
+        char tmpperm[4] = "";
+        if ((p & ACCESS_READ) && (p & ACCESS_WRITE)) strcpy(tmpperm, "RW");
+        else if (p & ACCESS_READ) strcpy(tmpperm, "R");
+        else if (p & ACCESS_WRITE) strcpy(tmpperm, "RW");
+        else strcpy(tmpperm, "-");
+
+        if (i > 0) {
+            off += snprintf(acl_str + off, sizeof(acl_str) - off, ",%s:%s", user, tmpperm);
+        } else {
+            off += snprintf(acl_str + off, sizeof(acl_str) - off, "%s:%s", user, tmpperm);
+        }
+    }
+
+    // Build request to storage server to persist ACL
+    int ss_fd = file_entry->ss_socket_fd;
+    request_packet_t ss_request;
+    memset(&ss_request, 0, sizeof(ss_request));
+    ss_request.magic = PROTOCOL_MAGIC;
+    ss_request.command = CMD_UPDATE_ACL;
+    // Forward the original user as the actor
+    strncpy(ss_request.username, req->username, sizeof(ss_request.username) - 1);
+    snprintf(ss_request.args, sizeof(ss_request.args), "%s %s", filename, acl_str);
+    ss_request.checksum = calculate_checksum(&ss_request, sizeof(ss_request) - sizeof(uint32_t));
+
+    // Send to SS and wait for response
+    if (send_packet(ss_fd, &ss_request) < 0) {
+        // rollback
+        memcpy(&file_entry->metadata, &old_meta, sizeof(file_metadata_t));
+        response.status = STATUS_ERROR_NETWORK;
+        snprintf(response.data, sizeof(response.data), "Failed to communicate with storage server");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "Failed to send UPDATE_ACL to SS");
+        return;
+    }
+
+    response_packet_t ss_response;
+    int r = recv_packet(ss_fd, &ss_response);
+    if (r <= 0 || ss_response.status != STATUS_OK) {
+        // rollback
+        memcpy(&file_entry->metadata, &old_meta, sizeof(file_metadata_t));
+        response.status = (r <= 0) ? STATUS_ERROR_NETWORK : ss_response.status;
+        snprintf(response.data, sizeof(response.data), "%s", (r <= 0) ? "Storage server did not respond" : ss_response.data);
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "SS failed to persist ACL change: %s", (r <= 0) ? "no response" : ss_response.data);
+        return;
+    }
+
+    // Persisted successfully
     response.status = STATUS_OK;
     snprintf(response.data, sizeof(response.data), "Access granted successfully");
     response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
     send_response(client_fd, &response);
-    
+
     LOG_INFO_MSG("NAME_SERVER", "User '%s' granted %s access to '%s' for user '%s'",
                  req->username, permission, filename, target_user);
 }
@@ -1108,6 +1197,10 @@ void handle_remaccess(int client_fd, request_packet_t* req) {
         return;
     }
     
+    // Snapshot old metadata for rollback
+    file_metadata_t old_meta;
+    memcpy(&old_meta, &file_entry->metadata, sizeof(file_metadata_t));
+
     // Find and remove ACL entry
     int found = 0;
     for (int i = 0; i < file_entry->metadata.access_count; i++) {
@@ -1135,11 +1228,520 @@ void handle_remaccess(int client_fd, request_packet_t* req) {
         return;
     }
     
+    // At this point ACL in memory has been updated; persist to storage server
+    // Build ACL serialization
+    char acl_str[MAX_ARGS_LEN];
+    memset(acl_str, 0, sizeof(acl_str));
+    int off = 0;
+    for (int i = 0; i < file_entry->metadata.access_count && off < (int)sizeof(acl_str) - 50; i++) {
+        int p = file_entry->metadata.access_permissions[i];
+        const char* user = file_entry->metadata.access_list[i];
+        char tmpperm[4] = "";
+        if ((p & ACCESS_READ) && (p & ACCESS_WRITE)) strcpy(tmpperm, "RW");
+        else if (p & ACCESS_READ) strcpy(tmpperm, "R");
+        else if (p & ACCESS_WRITE) strcpy(tmpperm, "RW");
+        else strcpy(tmpperm, "-");
+
+        if (i > 0) off += snprintf(acl_str + off, sizeof(acl_str) - off, ",%s:%s", user, tmpperm);
+        else off += snprintf(acl_str + off, sizeof(acl_str) - off, "%s:%s", user, tmpperm);
+    }
+
+    int ss_fd = file_entry->ss_socket_fd;
+    request_packet_t ss_request;
+    memset(&ss_request, 0, sizeof(ss_request));
+    ss_request.magic = PROTOCOL_MAGIC;
+    ss_request.command = CMD_UPDATE_ACL;
+    strncpy(ss_request.username, req->username, sizeof(ss_request.username) - 1);
+    snprintf(ss_request.args, sizeof(ss_request.args), "%s %s", filename, acl_str);
+    ss_request.checksum = calculate_checksum(&ss_request, sizeof(ss_request) - sizeof(uint32_t));
+
+    if (send_packet(ss_fd, &ss_request) < 0) {
+        // rollback: restore old metadata
+        memcpy(&file_entry->metadata, &old_meta, sizeof(file_metadata_t));
+        response.status = STATUS_ERROR_NETWORK;
+        snprintf(response.data, sizeof(response.data), "Failed to communicate with storage server");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "Failed to send UPDATE_ACL to SS");
+        return;
+    }
+
+    response_packet_t ss_response;
+    int r = recv_packet(ss_fd, &ss_response);
+    if (r <= 0 || ss_response.status != STATUS_OK) {
+        // rollback
+        memcpy(&file_entry->metadata, &old_meta, sizeof(file_metadata_t));
+        response.status = (r <= 0) ? STATUS_ERROR_NETWORK : ss_response.status;
+        snprintf(response.data, sizeof(response.data), "%s", (r <= 0) ? "Storage server did not respond" : ss_response.data);
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "SS failed to persist ACL removal: %s", (r <= 0) ? "no response" : ss_response.data);
+        return;
+    }
+
     response.status = STATUS_OK;
     snprintf(response.data, sizeof(response.data), "Access revoked successfully");
     response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
     send_response(client_fd, &response);
-    
+
     LOG_INFO_MSG("NAME_SERVER", "User '%s' revoked access to '%s' from user '%s'",
                  req->username, filename, target_user);
+}
+
+// Phase 5.2: Handle READ file request - return Storage Server location
+void handle_read_file(int client_fd, request_packet_t* req) {
+    LOG_INFO_MSG("NAME_SERVER", "Handling READ request for file: %s by user: %s",
+                 req->args, req->username);
+    
+    response_packet_t response;
+    memset(&response, 0, sizeof(response));
+    response.magic = PROTOCOL_MAGIC;
+    
+    // Extract filename from args
+    char filename[MAX_FILENAME_LEN];
+    sscanf(req->args, "%s", filename);
+    
+    // Find file in registry
+    file_hash_entry_t* file_entry = find_file_in_table(&file_table, filename);
+    if (file_entry == NULL) {
+        response.status = STATUS_ERROR_NOT_FOUND;
+        snprintf(response.data, sizeof(response.data), "File '%s' not found", filename);
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_WARNING_MSG("NAME_SERVER", "File not found: %s", filename);
+        return;
+    }
+    
+    // Check read access
+    if (!check_user_has_access(file_entry, req->username, ACCESS_READ)) {
+        response.status = STATUS_ERROR_READ_PERMISSION;
+        snprintf(response.data, sizeof(response.data), 
+                "Permission denied: You do not have read access to this file");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_WARNING_MSG("NAME_SERVER", "User '%s' denied read access to file '%s'",
+                       req->username, filename);
+        return;
+    }
+    
+    // Get storage server info
+    int ss_fd = file_entry->ss_socket_fd;
+    ss_node_t* ss = find_storage_server_by_fd(storage_servers_list, ss_fd);
+    if (ss == NULL) {
+        response.status = STATUS_ERROR_SERVER_UNAVAILABLE;
+        snprintf(response.data, sizeof(response.data), 
+                "Storage server not available");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "Storage server not found for file: %s", filename);
+        return;
+    }
+    
+    // Send storage server location to client
+    char location[128];
+    snprintf(location, sizeof(location), "%s:%d", ss->data.ip, ss->data.client_port);
+    
+    response.status = STATUS_OK;
+    snprintf(response.data, sizeof(response.data), "%s", location);
+    response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+    send_response(client_fd, &response);
+    
+    LOG_INFO_MSG("NAME_SERVER", "Directed user '%s' to read '%s' from SS at %s",
+                 req->username, filename, location);
+}
+
+// Phase 5.2: Handle STREAM file request - same as READ (return SS location)
+void handle_stream_file(int client_fd, request_packet_t* req) {
+    LOG_INFO_MSG("NAME_SERVER", "Handling STREAM request for file: %s by user: %s",
+                 req->args, req->username);
+    
+    response_packet_t response;
+    memset(&response, 0, sizeof(response));
+    response.magic = PROTOCOL_MAGIC;
+    
+    // Extract filename from args
+    char filename[MAX_FILENAME_LEN];
+    sscanf(req->args, "%s", filename);
+    
+    // Find file in registry
+    file_hash_entry_t* file_entry = find_file_in_table(&file_table, filename);
+    if (file_entry == NULL) {
+        response.status = STATUS_ERROR_NOT_FOUND;
+        snprintf(response.data, sizeof(response.data), "File '%s' not found", filename);
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_WARNING_MSG("NAME_SERVER", "File not found: %s", filename);
+        return;
+    }
+    
+    // Check read access (streaming requires read permission)
+    if (!check_user_has_access(file_entry, req->username, ACCESS_READ)) {
+        response.status = STATUS_ERROR_READ_PERMISSION;
+        snprintf(response.data, sizeof(response.data), 
+                "Permission denied: You do not have read access to this file");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_WARNING_MSG("NAME_SERVER", "User '%s' denied stream access to file '%s'",
+                       req->username, filename);
+        return;
+    }
+    
+    // Get storage server info
+    int ss_fd = file_entry->ss_socket_fd;
+    ss_node_t* ss = find_storage_server_by_fd(storage_servers_list, ss_fd);
+    if (ss == NULL) {
+        response.status = STATUS_ERROR_SERVER_UNAVAILABLE;
+        snprintf(response.data, sizeof(response.data), 
+                "Storage server not available");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "Storage server not found for file: %s", filename);
+        return;
+    }
+    
+    // Send storage server location to client
+    char location[128];
+    snprintf(location, sizeof(location), "%s:%d", ss->data.ip, ss->data.client_port);
+    
+    response.status = STATUS_OK;
+    snprintf(response.data, sizeof(response.data), "%s", location);
+    response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+    send_response(client_fd, &response);
+    
+    LOG_INFO_MSG("NAME_SERVER", "Directed user '%s' to stream '%s' from SS at %s",
+                 req->username, filename, location);
+}
+
+// Phase 5.3: Handle WRITE file request - check write permission and return SS location
+void handle_write_file(int client_fd, request_packet_t* req) {
+    LOG_INFO_MSG("NAME_SERVER", "Handling WRITE request for file: %s by user: %s",
+                 req->args, req->username);
+    
+    response_packet_t response;
+    memset(&response, 0, sizeof(response));
+    response.magic = PROTOCOL_MAGIC;
+    
+    // Extract filename from args (format: "filename sentence_num")
+    char filename[MAX_FILENAME_LEN];
+    int sentence_num = 0;
+    sscanf(req->args, "%s %d", filename, &sentence_num);
+    
+    // Find file in registry
+    file_hash_entry_t* file_entry = find_file_in_table(&file_table, filename);
+    if (file_entry == NULL) {
+        response.status = STATUS_ERROR_NOT_FOUND;
+        snprintf(response.data, sizeof(response.data), "File '%s' not found", filename);
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_WARNING_MSG("NAME_SERVER", "File not found: %s", filename);
+        return;
+    }
+    
+    // Check write access
+    if (!check_user_has_access(file_entry, req->username, ACCESS_WRITE)) {
+        response.status = STATUS_ERROR_WRITE_PERMISSION;
+        snprintf(response.data, sizeof(response.data), 
+                "Permission denied: You do not have write access to this file");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_WARNING_MSG("NAME_SERVER", "User '%s' denied write access to file '%s'",
+                       req->username, filename);
+        return;
+    }
+    
+    // Get storage server info
+    int ss_fd = file_entry->ss_socket_fd;
+    ss_node_t* ss = find_storage_server_by_fd(storage_servers_list, ss_fd);
+    if (ss == NULL) {
+        response.status = STATUS_ERROR_SERVER_UNAVAILABLE;
+        snprintf(response.data, sizeof(response.data), 
+                "Storage server not available");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "Storage server not found for file: %s", filename);
+        return;
+    }
+    
+    // Send storage server location to client
+    char location[128];
+    snprintf(location, sizeof(location), "%s:%d", ss->data.ip, ss->data.client_port);
+    
+    response.status = STATUS_OK;
+    snprintf(response.data, sizeof(response.data), "%s", location);
+    response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+    send_response(client_fd, &response);
+    
+    LOG_INFO_MSG("NAME_SERVER", "Directed user '%s' to write to '%s' sentence %d at SS %s",
+                 req->username, filename, sentence_num, location);
+}
+
+// Phase 5.3: Handle UNDO file request - forward to storage server
+void handle_undo_file(int client_fd, request_packet_t* req) {
+    LOG_INFO_MSG("NAME_SERVER", "Handling UNDO request for file: %s by user: %s",
+                 req->args, req->username);
+    
+    response_packet_t response;
+    memset(&response, 0, sizeof(response));
+    response.magic = PROTOCOL_MAGIC;
+    
+    // Extract filename from args
+    char filename[MAX_FILENAME_LEN];
+    sscanf(req->args, "%s", filename);
+    
+    // Find file in registry
+    file_hash_entry_t* file_entry = find_file_in_table(&file_table, filename);
+    if (file_entry == NULL) {
+        response.status = STATUS_ERROR_NOT_FOUND;
+        snprintf(response.data, sizeof(response.data), "File '%s' not found", filename);
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_WARNING_MSG("NAME_SERVER", "File not found: %s", filename);
+        return;
+    }
+    
+    // Check write access (undo requires write permission)
+    if (!check_user_has_access(file_entry, req->username, ACCESS_WRITE)) {
+        response.status = STATUS_ERROR_WRITE_PERMISSION;
+        snprintf(response.data, sizeof(response.data), 
+                "Permission denied: You do not have write access to this file");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_WARNING_MSG("NAME_SERVER", "User '%s' denied undo access to file '%s'",
+                       req->username, filename);
+        return;
+    }
+    
+    // Get storage server
+    int ss_fd = file_entry->ss_socket_fd;
+    ss_node_t* ss = find_storage_server_by_fd(storage_servers_list, ss_fd);
+    if (ss == NULL) {
+        response.status = STATUS_ERROR_SERVER_UNAVAILABLE;
+        snprintf(response.data, sizeof(response.data), 
+                "Storage server not available");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "Storage server not found for file: %s", filename);
+        return;
+    }
+    
+    // Forward CMD_UNDO request to storage server
+    request_packet_t ss_request;
+    memset(&ss_request, 0, sizeof(ss_request));
+    ss_request.magic = PROTOCOL_MAGIC;
+    ss_request.command = CMD_UNDO;
+    strncpy(ss_request.username, req->username, sizeof(ss_request.username) - 1);
+    strncpy(ss_request.args, filename, sizeof(ss_request.args) - 1);
+    ss_request.checksum = calculate_checksum(&ss_request, sizeof(ss_request) - sizeof(uint32_t));
+    
+    if (send_packet(ss_fd, &ss_request) < 0) {
+        response.status = STATUS_ERROR_INTERNAL;
+        snprintf(response.data, sizeof(response.data), 
+                "Failed to communicate with storage server");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "Failed to forward UNDO to storage server");
+        return;
+    }
+    
+    // Receive response from storage server
+    response_packet_t ss_response;
+    if (recv_packet(ss_fd, &ss_response) <= 0) {
+        response.status = STATUS_ERROR_INTERNAL;
+        snprintf(response.data, sizeof(response.data), 
+                "Failed to receive response from storage server");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "Failed to receive UNDO response from storage server");
+        return;
+    }
+    
+    // Forward storage server's response to client
+    send_response(client_fd, &ss_response);
+    
+    LOG_INFO_MSG("NAME_SERVER", "UNDO operation for '%s' by '%s': %s",
+                 filename, req->username, 
+                 ss_response.status == STATUS_OK ? "SUCCESS" : "FAILED");
+}
+
+// Phase 5.4: Handle EXEC command - execute script file and return output
+void handle_exec_command(int client_fd, request_packet_t* req) {
+    LOG_INFO_MSG("NAME_SERVER", "Handling EXEC request for file: %s by user: %s",
+                 req->args, req->username);
+    
+    response_packet_t response;
+    memset(&response, 0, sizeof(response));
+    response.magic = PROTOCOL_MAGIC;
+    
+    // Extract filename from args
+    char filename[MAX_FILENAME_LEN];
+    sscanf(req->args, "%s", filename);
+    
+    // Find file in registry
+    file_hash_entry_t* file_entry = find_file_in_table(&file_table, filename);
+    if (file_entry == NULL) {
+        response.status = STATUS_ERROR_NOT_FOUND;
+        snprintf(response.data, sizeof(response.data), "File '%s' not found", filename);
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_WARNING_MSG("NAME_SERVER", "File not found: %s", filename);
+        return;
+    }
+    
+    // Check read access (exec requires read permission)
+    if (!check_user_has_access(file_entry, req->username, ACCESS_READ)) {
+        response.status = STATUS_ERROR_READ_PERMISSION;
+        snprintf(response.data, sizeof(response.data), 
+                "Permission denied: You do not have read access to this file");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_WARNING_MSG("NAME_SERVER", "User '%s' denied exec access to file '%s'",
+                       req->username, filename);
+        return;
+    }
+    
+    // Get storage server
+    int ss_fd = file_entry->ss_socket_fd;
+    ss_node_t* ss = find_storage_server_by_fd(storage_servers_list, ss_fd);
+    if (ss == NULL) {
+        response.status = STATUS_ERROR_SERVER_UNAVAILABLE;
+        snprintf(response.data, sizeof(response.data), 
+                "Storage server not available");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "Storage server not found for file: %s", filename);
+        return;
+    }
+    
+    // Request file content from storage server
+    request_packet_t ss_request;
+    memset(&ss_request, 0, sizeof(ss_request));
+    ss_request.magic = PROTOCOL_MAGIC;
+    ss_request.command = CMD_READ;
+    strncpy(ss_request.username, req->username, sizeof(ss_request.username) - 1);
+    strncpy(ss_request.args, filename, sizeof(ss_request.args) - 1);
+    ss_request.checksum = calculate_checksum(&ss_request, sizeof(ss_request) - sizeof(uint32_t));
+    
+    if (send_packet(ss_fd, &ss_request) < 0) {
+        response.status = STATUS_ERROR_INTERNAL;
+        snprintf(response.data, sizeof(response.data), 
+                "Failed to communicate with storage server");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "Failed to request file from storage server");
+        return;
+    }
+    
+    // Receive file content from storage server
+    response_packet_t ss_response;
+    if (recv_packet(ss_fd, &ss_response) <= 0) {
+        response.status = STATUS_ERROR_INTERNAL;
+        snprintf(response.data, sizeof(response.data), 
+                "Failed to receive file from storage server");
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "Failed to receive file from storage server");
+        return;
+    }
+    
+    if (ss_response.status != STATUS_OK) {
+        // Forward error from storage server
+        send_response(client_fd, &ss_response);
+        LOG_ERROR_MSG("NAME_SERVER", "Storage server error: %s", ss_response.data);
+        return;
+    }
+    
+    // Now execute the script using fork/exec with pipes to capture output
+    int pipe_fd[2];
+    if (pipe(pipe_fd) < 0) {
+        response.status = STATUS_ERROR_INTERNAL;
+        snprintf(response.data, sizeof(response.data), 
+                "Failed to create pipe: %s", strerror(errno));
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "pipe() failed: %s", strerror(errno));
+        return;
+    }
+    
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        response.status = STATUS_ERROR_INTERNAL;
+        snprintf(response.data, sizeof(response.data), 
+                "Failed to fork: %s", strerror(errno));
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        LOG_ERROR_MSG("NAME_SERVER", "fork() failed: %s", strerror(errno));
+        return;
+    }
+    
+    if (pid == 0) {
+        // Child process
+        close(pipe_fd[0]); // Close read end
+        
+        // Redirect stdout and stderr to pipe
+        dup2(pipe_fd[1], STDOUT_FILENO);
+        dup2(pipe_fd[1], STDERR_FILENO);
+        close(pipe_fd[1]);
+        
+        // Write script to temporary file
+        char temp_script[64];
+        snprintf(temp_script, sizeof(temp_script), "/tmp/exec_%d.sh", getpid());
+        FILE* script_fp = fopen(temp_script, "w");
+        if (script_fp == NULL) {
+            fprintf(stderr, "Failed to create temp script\n");
+            exit(1);
+        }
+        
+        fwrite(ss_response.data, 1, strlen(ss_response.data), script_fp);
+        fclose(script_fp);
+        
+        // Make script executable
+        chmod(temp_script, 0700);
+        
+        // Execute the script
+        execlp("/bin/sh", "sh", temp_script, NULL);
+        
+        // If exec fails
+        fprintf(stderr, "Failed to execute script: %s\n", strerror(errno));
+        exit(1);
+    } else {
+        // Parent process
+        close(pipe_fd[1]); // Close write end
+        
+        // Read output from pipe
+        char output_buffer[MAX_RESPONSE_DATA_LEN];
+        ssize_t total_read = 0;
+        ssize_t bytes_read;
+        
+        while ((bytes_read = read(pipe_fd[0], 
+                                  output_buffer + total_read,
+                                  sizeof(output_buffer) - total_read - 1)) > 0) {
+            total_read += bytes_read;
+            if (total_read >= (ssize_t)(sizeof(output_buffer) - 1)) {
+                break; // Buffer full
+            }
+        }
+        output_buffer[total_read] = '\0';
+        close(pipe_fd[0]);
+        
+        // Wait for child to complete
+        int status;
+        waitpid(pid, &status, 0);
+        
+        // Clean up temporary script
+        char temp_script[64];
+        snprintf(temp_script, sizeof(temp_script), "/tmp/exec_%d.sh", pid);
+        unlink(temp_script);
+        
+        // Send output to client
+        response.status = STATUS_OK;
+        strncpy(response.data, output_buffer, sizeof(response.data) - 1);
+        response.data[sizeof(response.data) - 1] = '\0';
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        send_response(client_fd, &response);
+        
+        LOG_INFO_MSG("NAME_SERVER", "EXEC completed for '%s' by '%s' (exit status: %d)",
+                     filename, req->username, WEXITSTATUS(status));
+    }
 }
