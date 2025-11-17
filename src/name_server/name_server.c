@@ -73,6 +73,10 @@ int main(int argc, char* argv[]) {
     
     printf("Name Server starting on port %d...\n", port);
     
+    // Phase 6: Initialize logging
+    init_logging("logs/name_server.log", LOG_INFO, 1);
+    LOG_INFO_MSG("NAME_SERVER", "Starting Name Server on port %d", port);
+    
     // Set up signal handlers
     signal(SIGINT, cleanup_and_exit);
     signal(SIGTERM, cleanup_and_exit);
@@ -303,6 +307,28 @@ void process_connection_data(int sockfd) {
         printf("Received corrupted packet from fd=%d\n", sockfd);
         return;
     }
+    
+    // Phase 6: Log incoming request
+    const char* cmd_name = "UNKNOWN";
+    switch (request.command) {
+        case CMD_CREATE: cmd_name = "CREATE"; break;
+        case CMD_DELETE: cmd_name = "DELETE"; break;
+        case CMD_READ: cmd_name = "READ"; break;
+        case CMD_WRITE: cmd_name = "WRITE"; break;
+        case CMD_STREAM: cmd_name = "STREAM"; break;
+        case CMD_UNDO: cmd_name = "UNDO"; break;
+        case CMD_EXEC: cmd_name = "EXEC"; break;
+        case CMD_LIST: cmd_name = "LIST"; break;
+        case CMD_VIEW: cmd_name = "VIEW"; break;
+        case CMD_INFO: cmd_name = "INFO"; break;
+        case CMD_ADDACCESS: cmd_name = "ADDACCESS"; break;
+        case CMD_REMACCESS: cmd_name = "REMACCESS"; break;
+        case CMD_SS_INIT: cmd_name = "SS_INIT"; break;
+        case CMD_CLIENT_INIT: cmd_name = "CLIENT_INIT"; break;
+        default: break;
+    }
+    LOG_INFO_MSG("REQUEST", "From fd=%d user=%s | Command: %s | Args: %s", 
+                 sockfd, request.username, cmd_name, request.args);
     
     // Handle different initialization commands
     switch (request.command) {

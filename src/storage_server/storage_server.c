@@ -93,6 +93,11 @@ int main(int argc, char* argv[]) {
     printf("Storage Path: %s\n", storage_path);
     printf("Client Port: %d\n", client_port);
     
+    // Phase 6: Initialize logging
+    init_logging("logs/storage_server.log", LOG_INFO, 1);
+    LOG_INFO_MSG("STORAGE_SERVER", "Starting Storage Server - NM: %s:%d, Path: %s, Client Port: %d",
+                 nm_ip, nm_port, storage_path, client_port);
+    
     // Set up signal handlers
     signal(SIGINT, cleanup_and_exit);
     signal(SIGTERM, cleanup_and_exit);
@@ -397,6 +402,7 @@ void* client_connection_thread(void* arg) {
     
     // Phase 5.3: Thread-local state for WRITE sessions
     char* file_buffer = NULL;
+    size_t file_buffer_size = 0;
     char session_filename[MAX_FILENAME_LEN] = "";
     int session_sentence = -1;
     char session_user[MAX_USERNAME_LEN] = "";
@@ -653,7 +659,8 @@ void* client_connection_thread(void* arg) {
                         fseek(fp, 0, SEEK_SET);
                         
                         // Allocate buffer and read file
-                        file_buffer = (char*)malloc(file_size + 1);
+                        file_buffer_size = file_size + 1;
+                        file_buffer = (char*)malloc(file_buffer_size);
                         if (file_buffer == NULL) {
                             fclose(fp);
                             release_lock(filename, sentence_num, request.username);
@@ -699,8 +706,74 @@ void* client_connection_thread(void* arg) {
                             break;
                         }
                         
-                        // TODO: Update word in file_buffer using file_ops functions
-                        // For now, just acknowledge the update
+                        // Parse file content into sentences
+                        file_content_t content;
+                        if (parse_file_into_sentences(file_buffer, &content) != 0) {
+                            response.status = STATUS_ERROR_INTERNAL;
+                            snprintf(response.data, sizeof(response.data),
+                                    "Failed to parse file content");
+                            response.checksum = calculate_checksum(&response,
+                                                                   sizeof(response) - sizeof(uint32_t));
+                            send_response(sock, &response);
+                            break;
+                        }
+                        
+                        // Validate sentence index
+                        if (session_sentence < 0 || session_sentence >= content.sentence_count) {
+                            response.status = STATUS_ERROR_INTERNAL;
+                            snprintf(response.data, sizeof(response.data),
+                                    "Invalid sentence index");
+                            response.checksum = calculate_checksum(&response,
+                                                                   sizeof(response) - sizeof(uint32_t));
+                            send_response(sock, &response);
+                            break;
+                        }
+                        
+                        // Replace the word in the locked sentence
+                        if (replace_word_at_position(&content.sentences[session_sentence], 
+                                                    word_index, word_content) != 0) {
+                            response.status = STATUS_ERROR_INTERNAL;
+                            snprintf(response.data, sizeof(response.data),
+                                    "Failed to replace word at position %d", word_index);
+                            response.checksum = calculate_checksum(&response,
+                                                                   sizeof(response) - sizeof(uint32_t));
+                            send_response(sock, &response);
+                            break;
+                        }
+                        
+                        // Serialize back to buffer
+                        char new_buffer[MAX_CONTENT_LEN];
+                        if (serialize_sentences_to_content(&content, new_buffer, 
+                                                          sizeof(new_buffer)) != 0) {
+                            response.status = STATUS_ERROR_INTERNAL;
+                            snprintf(response.data, sizeof(response.data),
+                                    "Failed to serialize content");
+                            response.checksum = calculate_checksum(&response,
+                                                                   sizeof(response) - sizeof(uint32_t));
+                            send_response(sock, &response);
+                            break;
+                        }
+                        
+                        // Check if we need to realloc file_buffer
+                        size_t new_size = strlen(new_buffer) + 1;
+                        if (new_size > file_buffer_size) {
+                            char* new_ptr = realloc(file_buffer, new_size);
+                            if (new_ptr == NULL) {
+                                response.status = STATUS_ERROR_INTERNAL;
+                                snprintf(response.data, sizeof(response.data),
+                                        "Memory allocation failed");
+                                response.checksum = calculate_checksum(&response,
+                                                                       sizeof(response) - sizeof(uint32_t));
+                                send_response(sock, &response);
+                                break;
+                            }
+                            file_buffer = new_ptr;
+                            file_buffer_size = new_size;
+                        }
+                        
+                        // Update the file buffer with new content
+                        strcpy(file_buffer, new_buffer);
+                        
                         response.status = STATUS_OK;
                         snprintf(response.data, sizeof(response.data),
                                 "Word %d updated to '%s'", word_index, word_content);

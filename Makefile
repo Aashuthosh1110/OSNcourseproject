@@ -14,7 +14,7 @@ LOGDIR = logs
 STORAGEDIR = storage
 
 # Common source files
-COMMON_SRCS = $(SRCDIR)/common/common.c $(SRCDIR)/common/errors.c $(SRCDIR)/common/logging.c $(SRCDIR)/common/protocol.c
+COMMON_SRCS = $(SRCDIR)/common/common.c $(SRCDIR)/common/errors.c $(SRCDIR)/common/logging.c $(SRCDIR)/common/protocol.c $(SRCDIR)/common/file_ops.c
 
 # Target executables
 TARGETS = $(BINDIR)/name_server $(BINDIR)/storage_server $(BINDIR)/client

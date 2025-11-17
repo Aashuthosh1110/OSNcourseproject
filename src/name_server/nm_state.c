@@ -6,8 +6,29 @@
 
 #include "common.h"
 #include "protocol.h"
+#include "logging.h"
 #include <string.h>
 #include <stdlib.h>
+
+// Phase 6: LRU Cache for efficient file search
+#define LRU_CACHE_CAPACITY 10
+
+typedef struct lru_node {
+    char filename[MAX_FILENAME_LEN];
+    file_hash_entry_t* entry;
+    struct lru_node* prev;
+    struct lru_node* next;
+} lru_node_t;
+
+typedef struct {
+    lru_node_t* head;  // Most recently used
+    lru_node_t* tail;  // Least recently used
+    int count;
+    int capacity;
+} lru_cache_t;
+
+// Global LRU cache
+static lru_cache_t lru_cache = {NULL, NULL, 0, LRU_CACHE_CAPACITY};
 
 // Hash function for filename strings
 unsigned int hash_filename(const char* filename) {
@@ -71,19 +92,121 @@ int add_file_to_table(file_hash_table_t* table, const char* filename, int ss_soc
     return 0;
 }
 
-// Find file in hash table
+// Phase 6: LRU Cache helper functions
+
+// Remove node from LRU list (but don't free it)
+static void lru_remove_node(lru_node_t* node) {
+    if (node->prev) {
+        node->prev->next = node->next;
+    } else {
+        lru_cache.head = node->next;
+    }
+    
+    if (node->next) {
+        node->next->prev = node->prev;
+    } else {
+        lru_cache.tail = node->prev;
+    }
+}
+
+// Add node to front of LRU list (mark as most recently used)
+static void lru_add_to_front(lru_node_t* node) {
+    node->next = lru_cache.head;
+    node->prev = NULL;
+    
+    if (lru_cache.head) {
+        lru_cache.head->prev = node;
+    }
+    
+    lru_cache.head = node;
+    
+    if (lru_cache.tail == NULL) {
+        lru_cache.tail = node;
+    }
+}
+
+// Get entry from LRU cache
+static file_hash_entry_t* lru_get(const char* filename) {
+    // Search for node in cache
+    lru_node_t* current = lru_cache.head;
+    while (current != NULL) {
+        if (strcmp(current->filename, filename) == 0) {
+            // Found! Move to front (mark as recently used)
+            lru_remove_node(current);
+            lru_add_to_front(current);
+            return current->entry;
+        }
+        current = current->next;
+    }
+    
+    return NULL;  // Cache miss
+}
+
+// Put entry into LRU cache
+static void lru_put(const char* filename, file_hash_entry_t* entry) {
+    // Check if already in cache
+    lru_node_t* current = lru_cache.head;
+    while (current != NULL) {
+        if (strcmp(current->filename, filename) == 0) {
+            // Update and move to front
+            current->entry = entry;
+            lru_remove_node(current);
+            lru_add_to_front(current);
+            return;
+        }
+        current = current->next;
+    }
+    
+    // Not in cache, create new node
+    lru_node_t* new_node = malloc(sizeof(lru_node_t));
+    if (new_node == NULL) {
+        return;  // Failed to allocate
+    }
+    
+    strncpy(new_node->filename, filename, MAX_FILENAME_LEN - 1);
+    new_node->filename[MAX_FILENAME_LEN - 1] = '\0';
+    new_node->entry = entry;
+    new_node->prev = NULL;
+    new_node->next = NULL;
+    
+    // If cache is full, remove least recently used (tail)
+    if (lru_cache.count >= lru_cache.capacity) {
+        lru_node_t* old_tail = lru_cache.tail;
+        lru_remove_node(old_tail);
+        free(old_tail);
+        lru_cache.count--;
+    }
+    
+    // Add new node to front
+    lru_add_to_front(new_node);
+    lru_cache.count++;
+}
+
+// Find file in hash table (with LRU cache)
 file_hash_entry_t* find_file_in_table(file_hash_table_t* table, const char* filename) {
+    // Phase 6: Check LRU cache first
+    file_hash_entry_t* cached = lru_get(filename);
+    if (cached != NULL) {
+        LOG_INFO_MSG("NAME_SERVER", "LRU Cache HIT for file '%s'", filename);
+        return cached;
+    }
+    
+    LOG_INFO_MSG("NAME_SERVER", "LRU Cache MISS for file '%s', searching hash table", filename);
+    
+    // Cache miss, do hash table lookup
     unsigned int index = hash_filename(filename);
     
     file_hash_entry_t* current = table->buckets[index];
     while (current != NULL) {
         if (strcmp(current->filename, filename) == 0) {
+            // Found in hash table, add to cache
+            lru_put(filename, current);
             return current;
         }
         current = current->next;
     }
     
-    return NULL;
+    return NULL;  // Not found
 }
 
 // Remove file from hash table
