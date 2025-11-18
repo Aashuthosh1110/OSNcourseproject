@@ -14,6 +14,7 @@ void init_file_hash_table(file_hash_table_t* table);
 int add_file_to_table(file_hash_table_t* table, const char* filename, int ss_socket_fd, file_metadata_t* metadata);
 file_hash_entry_t* find_file_in_table(file_hash_table_t* table, const char* filename);
 int remove_file_from_table(file_hash_table_t* table, const char* filename);
+void remove_file_from_lru_cache(const char* filename);
 
 // Storage server linked list functions
 ss_node_t* add_storage_server(ss_node_t** head, storage_server_info_t* ss_info, int socket_fd);
@@ -27,5 +28,12 @@ client_node_t* find_client_by_fd(client_node_t* head, int socket_fd);
 client_node_t* find_client_by_username(client_node_t* head, const char* username);
 int remove_client(client_node_t** head, int socket_fd);
 int count_clients(client_node_t* head);
+
+// Persistent user management functions
+client_node_t* register_or_reconnect_user(client_node_t** head, user_info_t* user_info);
+void disconnect_user(client_node_t* head, int socket_fd);
+int count_all_users(client_node_t* head);
+void save_user_registry(client_node_t* head);
+void load_user_registry(client_node_t** head);
 
 #endif // NM_STATE_H

@@ -7,8 +7,13 @@ echo "=== Phase 1: Basic TCP Skeleton Test ==="
 echo ""
 
 # Build all components
-echo "Building all components..."
+echo "Building components..."
+cd ..
 make all
+cd tests
+
+echo "Starting name server..."
+../bin/name_server 8080 &
 echo ""
 
 # Test 1: Start Name Server
@@ -22,7 +27,8 @@ echo ""
 # Test 2: Connect Storage Server
 echo "Step 2: Connecting Storage Server to Name Server..."
 echo "Expected: Name Server should print 'New connection received'"
-timeout 3 ./bin/storage_server 127.0.0.1 8080 &
+echo "Starting storage server..."
+timeout 3 ../bin/storage_server 127.0.0.1 8080 &
 SS_PID=$!
 sleep 2
 echo ""
@@ -30,7 +36,8 @@ echo ""
 # Test 3: Connect Client
 echo "Step 3: Connecting Client to Name Server..."
 echo "Expected: Name Server should print another 'New connection received'"
-echo "testuser" | timeout 3 ./bin/client 127.0.0.1 8080 &
+echo "Starting client..."
+echo "testuser" | timeout 3 ../bin/client 127.0.0.1 8080 &
 CLIENT_PID=$!
 sleep 2
 echo ""

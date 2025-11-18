@@ -278,7 +278,21 @@ void handle_nm_commands() {
         return;
     }
     
-    LOG_INFO_MSG("STORAGE_SERVER", "Received command from Name Server: command=%d", request.command);
+    // Enhanced logging with command details
+    const char* cmd_name = "UNKNOWN";
+    switch (request.command) {
+        case CMD_CREATE: cmd_name = "CREATE"; break;
+        case CMD_DELETE: cmd_name = "DELETE"; break;
+        case CMD_READ: cmd_name = "READ"; break;
+        case CMD_UNDO: cmd_name = "UNDO"; break;
+        case CMD_UPDATE_ACL: cmd_name = "UPDATE_ACL"; break;
+        default: break;
+    }
+    
+    printf("[SS] REQUEST from NM | Command: %s | User: %s | Args: %s\n", 
+           cmd_name, request.username, request.args);
+    LOG_INFO_MSG("REQUEST", "From Name Server | Command: %s | User: %s | Args: %s", 
+                 cmd_name, request.username, request.args);
     
     // Handle different command types from Name Server
     switch (request.command) {
@@ -425,8 +439,31 @@ void* client_connection_thread(void* arg) {
             continue;
         }
         
-        LOG_INFO_MSG("STORAGE_SERVER", "Received command %d from client socket %d", 
-                     request.command, sock);
+        // Get client address for logging
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        char client_ip[INET_ADDRSTRLEN];
+        int client_port = 0;
+        
+        if (getpeername(sock, (struct sockaddr*)&client_addr, &addr_len) == 0) {
+            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+            client_port = ntohs(client_addr.sin_port);
+        } else {
+            strcpy(client_ip, "unknown");
+        }
+        
+        const char* cmd_name = "UNKNOWN";
+        switch (request.command) {
+            case CMD_READ: cmd_name = "READ"; break;
+            case CMD_WRITE: cmd_name = "WRITE"; break;
+            case CMD_STREAM: cmd_name = "STREAM"; break;
+            default: break;
+        }
+        
+        printf("[SS] CLIENT_REQUEST from %s@%s:%d | Command: %s | Args: %s\n", 
+               request.username, client_ip, client_port, cmd_name, request.args);
+        LOG_INFO_MSG("CLIENT_REQUEST", "From %s@%s:%d (sock=%d) | Command: %s | Args: %s", 
+                     request.username, client_ip, client_port, sock, cmd_name, request.args);
         
         // Handle different client-facing commands
         switch (request.command) {
@@ -631,7 +668,7 @@ void* client_connection_thread(void* arg) {
                         if (!acquire_lock(filename, sentence_num, request.username)) {
                             response.status = STATUS_ERROR_LOCKED;
                             snprintf(response.data, sizeof(response.data),
-                                    "Sentence %d is locked by another user", sentence_num);
+                                    "Sentence %d is locked by another user", sentence_num); // Show 0-based to user
                             response.checksum = calculate_checksum(&response,
                                                                    sizeof(response) - sizeof(uint32_t));
                             send_response(sock, &response);
@@ -677,6 +714,15 @@ void* client_connection_thread(void* arg) {
                         file_buffer[bytes_read] = '\0';
                         fclose(fp);
                         
+                        // Handle empty files - if file is empty and user wants sentence 1, allow it
+                        if (file_size == 0 && sentence_num == 0) { // sentence_num is 0-based internally
+                            // Initialize empty content for empty file
+                            strcpy(file_buffer, "");
+                        } else if (file_size > 0) {
+                            // For non-empty files, validate sentence exists during word updates
+                            // (validation moved to word update section)
+                        }
+                        
                         // Store session info
                         strncpy(session_filename, filename, MAX_FILENAME_LEN - 1);
                         session_sentence = sentence_num;
@@ -685,7 +731,7 @@ void* client_connection_thread(void* arg) {
                         // Send success response
                         response.status = STATUS_OK;
                         snprintf(response.data, sizeof(response.data),
-                                "Lock acquired for sentence %d", sentence_num);
+                                "Lock acquired for sentence %d", sentence_num + 1); // Show 1-based to user
                         response.checksum = calculate_checksum(&response,
                                                                sizeof(response) - sizeof(uint32_t));
                         send_response(sock, &response);
@@ -718,11 +764,21 @@ void* client_connection_thread(void* arg) {
                             break;
                         }
                         
+                        // Handle empty files: if file is empty and trying to access sentence 0 (1-based input was 1)
+                        if (content.sentence_count == 0 && session_sentence == 0) {
+                            // Create first sentence for empty file
+                            content.sentence_count = 1;
+                            memset(&content.sentences[0], 0, sizeof(sentence_t));
+                            strcpy(content.sentences[0].content, ""); // Start with empty sentence
+                            content.sentences[0].word_count = 0;
+                        }
+                        
                         // Validate sentence index
                         if (session_sentence < 0 || session_sentence >= content.sentence_count) {
                             response.status = STATUS_ERROR_INTERNAL;
                             snprintf(response.data, sizeof(response.data),
-                                    "Invalid sentence index");
+                                    "Invalid sentence index %d (file has %d sentences)", 
+                                    session_sentence + 1, content.sentence_count); // Show 1-based to user
                             response.checksum = calculate_checksum(&response,
                                                                    sizeof(response) - sizeof(uint32_t));
                             send_response(sock, &response);
@@ -734,7 +790,7 @@ void* client_connection_thread(void* arg) {
                                                     word_index, word_content) != 0) {
                             response.status = STATUS_ERROR_INTERNAL;
                             snprintf(response.data, sizeof(response.data),
-                                    "Failed to replace word at position %d", word_index);
+                                    "Failed to replace word at position %d", word_index + 1); // Show 1-based to user
                             response.checksum = calculate_checksum(&response,
                                                                    sizeof(response) - sizeof(uint32_t));
                             send_response(sock, &response);
@@ -776,7 +832,7 @@ void* client_connection_thread(void* arg) {
                         
                         response.status = STATUS_OK;
                         snprintf(response.data, sizeof(response.data),
-                                "Word %d updated to '%s'", word_index, word_content);
+                                "Word %d updated to '%s'", word_index + 1, word_content); // Show 1-based to user
                         response.checksum = calculate_checksum(&response,
                                                                sizeof(response) - sizeof(uint32_t));
                         send_response(sock, &response);
@@ -863,6 +919,18 @@ void* client_connection_thread(void* arg) {
                     
                     // Release lock
                     release_lock(session_filename, session_sentence, session_user);
+                    
+                    // Update file metadata after modification
+                    char metapath[MAX_PATH_LEN];
+                    snprintf(metapath, sizeof(metapath), "%s/%s.meta", storage_path, session_filename);
+                    
+                    // Calculate new file statistics
+                    int word_count = 0, char_count = 0;
+                    size_t file_size = 0;
+                    calculate_file_stats(filepath, &word_count, &char_count, &file_size);
+                    
+                    // Update metadata file
+                    update_metadata_stats(metapath, word_count, char_count, file_size, request.username);
                     
                     // Free buffer and reset session
                     free(file_buffer);
@@ -1166,11 +1234,16 @@ void handle_create_request(request_packet_t* req) {
     
     // Check if file already exists
     if (access(filepath, F_OK) == 0) {
-        LOG_WARNING_MSG("STORAGE_SERVER", "File already exists: %s", filepath);
         response.status = STATUS_ERROR_FILE_EXISTS;
         snprintf(response.data, sizeof(response.data), 
                 "File already exists on storage");
         response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        
+        printf("[SS] RESPONSE to NM | Command: CREATE | Status: ERROR | File: %s | User: %s | Message: File already exists\n", 
+               filename, req->username);
+        LOG_WARNING_MSG("RESPONSE", "To Name Server | Command: CREATE | Status: ERROR | File: %s | User: %s | Message: %s", 
+                        filename, req->username, response.data);
+        
         send_response(nm_socket, &response);
         return;
     }
@@ -1210,6 +1283,12 @@ void handle_create_request(request_packet_t* req) {
     snprintf(response.data, sizeof(response.data), 
             "File created on storage");
     response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+    
+    printf("[SS] RESPONSE to NM | Command: CREATE | Status: SUCCESS | File: %s | User: %s\n", 
+           filename, req->username);
+    LOG_INFO_MSG("RESPONSE", "To Name Server | Command: CREATE | Status: SUCCESS | File: %s | User: %s | Message: %s", 
+                 filename, req->username, response.data);
+    
     send_response(nm_socket, &response);
 }
 
@@ -1320,6 +1399,75 @@ void handle_delete_request(request_packet_t* req) {
     send_response(nm_socket, &response);
 }
 
+// Update metadata file with new statistics
+void update_metadata_stats(const char* metapath, int word_count, int char_count, size_t size, const char* accessed_by) {
+    // Read existing metadata
+    char owner[MAX_USERNAME_LEN] = "";
+    long created = 0;
+    
+    FILE* mf = fopen(metapath, "r");
+    if (mf != NULL) {
+        char line[512];
+        while (fgets(line, sizeof(line), mf) != NULL) {
+            if (strncmp(line, "owner=", 6) == 0) {
+                sscanf(line + 6, "%63s", owner);
+            } else if (strncmp(line, "created=", 8) == 0) {
+                sscanf(line + 8, "%ld", &created);
+            }
+        }
+        fclose(mf);
+    }
+    
+    // Write updated metadata
+    FILE* out = fopen(metapath, "w");
+    if (out != NULL) {
+        time_t now = time(NULL);
+        
+        fprintf(out, "owner=%s\n", owner);
+        fprintf(out, "created=%ld\n", created);
+        fprintf(out, "modified=%ld\n", now);
+        fprintf(out, "accessed=%ld\n", now);
+        fprintf(out, "accessed_by=%s\n", accessed_by);
+        fprintf(out, "size=%zu\n", size);
+        fprintf(out, "word_count=%d\n", word_count);
+        fprintf(out, "char_count=%d\n", char_count);
+        
+        fclose(out);
+    }
+}
+
+// Calculate word and character counts from file content
+void calculate_file_stats(const char* filepath, int* word_count, int* char_count, size_t* size) {
+    *word_count = 0;
+    *char_count = 0;
+    *size = 0;
+    
+    FILE* file = fopen(filepath, "r");
+    if (file == NULL) {
+        return;
+    }
+    
+    int in_word = 0;
+    int ch;
+    
+    while ((ch = fgetc(file)) != EOF) {
+        (*char_count)++;
+        (*size)++;
+        
+        // Count words (sequences of non-space characters)
+        if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') {
+            if (!in_word) {
+                (*word_count)++;
+                in_word = 1;
+            }
+        } else {
+            in_word = 0;
+        }
+    }
+    
+    fclose(file);
+}
+
 // Phase 3: Create file metadata in .meta file
 int create_file_metadata(const char* filename, const char* owner) {
     char metapath[MAX_PATH_LEN];
@@ -1333,15 +1481,22 @@ int create_file_metadata(const char* filename, const char* owner) {
     
     time_t now = time(NULL);
     
+    // Calculate file statistics
+    char filepath[MAX_PATH_LEN];
+    snprintf(filepath, sizeof(filepath), "%s/%s", storage_path, filename);
+    int word_count = 0, char_count = 0;
+    size_t file_size = 0;
+    calculate_file_stats(filepath, &word_count, &char_count, &file_size);
+    
     // Write metadata in key=value format
     fprintf(meta_fp, "owner=%s\n", owner);
     fprintf(meta_fp, "created=%ld\n", now);
     fprintf(meta_fp, "modified=%ld\n", now);
     fprintf(meta_fp, "accessed=%ld\n", now);
     fprintf(meta_fp, "accessed_by=%s\n", owner);
-    fprintf(meta_fp, "size=0\n");
-    fprintf(meta_fp, "word_count=0\n");
-    fprintf(meta_fp, "char_count=0\n");
+    fprintf(meta_fp, "size=%zu\n", file_size);
+    fprintf(meta_fp, "word_count=%d\n", word_count);
+    fprintf(meta_fp, "char_count=%d\n", char_count);
     fprintf(meta_fp, "access_count=1\n");
     fprintf(meta_fp, "access_0=%s:RW\n", owner);  // Owner has read/write
     

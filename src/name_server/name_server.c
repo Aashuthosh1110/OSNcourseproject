@@ -11,6 +11,7 @@
 #include "../../include/nm_state.h"
 #include <signal.h>
 #include <sys/wait.h>
+#include <dirent.h>
 
 // Global state - Phase 2: Use linked lists and hash table
 static ss_node_t* storage_servers_list = NULL;
@@ -59,6 +60,102 @@ void handle_undo_file(int sockfd, request_packet_t* req);
 // Phase 5.4: Exec handler
 void handle_exec_command(int sockfd, request_packet_t* req);
 
+// Scan existing files in storage directories and add them to registry
+void scan_storage_files() {
+    LOG_INFO_MSG("NAME_SERVER", "Scanning for existing files in storage directories");
+    
+    // For now, we'll scan the main storage directory
+    // In a real implementation, this would scan all registered storage server directories
+    const char* storage_dir = "storage";
+    
+    DIR* dir = opendir(storage_dir);
+    if (dir == NULL) {
+        LOG_WARNING_MSG("NAME_SERVER", "Could not open storage directory: %s", storage_dir);
+        return;
+    }
+    
+    struct dirent* entry;
+    int files_found = 0;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        // Skip directories and hidden files
+        if (entry->d_name[0] == '.' || entry->d_type == DT_DIR) {
+            continue;
+        }
+        
+        // Skip .meta files, .bak files, and other auxiliary files
+        char* ext = strrchr(entry->d_name, '.');
+        if (ext && (strcmp(ext, ".meta") == 0 || strcmp(ext, ".bak") == 0)) {
+            continue;
+        }
+        
+        // Check if we already have this file in the registry
+        if (find_file_in_table(&file_table, entry->d_name) != NULL) {
+            continue; // Already registered
+        }
+        
+        // Check if corresponding .meta file exists
+        char meta_path[512];
+        snprintf(meta_path, sizeof(meta_path), "%s/%s.meta", storage_dir, entry->d_name);
+        
+        FILE* meta_file = fopen(meta_path, "r");
+        if (meta_file == NULL) {
+            LOG_WARNING_MSG("NAME_SERVER", "No metadata file found for %s, skipping", entry->d_name);
+            continue;
+        }
+        
+        // Create new file entry
+        file_hash_entry_t* new_entry = (file_hash_entry_t*)malloc(sizeof(file_hash_entry_t));
+        if (new_entry == NULL) {
+            LOG_ERROR_MSG("NAME_SERVER", "Memory allocation failed for file entry");
+            fclose(meta_file);
+            continue;
+        }
+        
+        // Initialize entry
+        memset(new_entry, 0, sizeof(file_hash_entry_t));
+        strncpy(new_entry->metadata.filename, entry->d_name, MAX_FILENAME_LEN - 1);
+        
+        // Read metadata from .meta file
+        char line[256];
+        while (fgets(line, sizeof(line), meta_file) != NULL) {
+            if (strncmp(line, "owner=", 6) == 0) {
+                sscanf(line + 6, "%s", new_entry->metadata.owner);
+            } else if (strncmp(line, "word_count=", 11) == 0) {
+                sscanf(line + 11, "%d", &new_entry->metadata.word_count);
+            } else if (strncmp(line, "char_count=", 11) == 0) {
+                sscanf(line + 11, "%d", &new_entry->metadata.char_count);
+            } else if (strncmp(line, "size=", 5) == 0) {
+                sscanf(line + 5, "%zu", &new_entry->metadata.size);
+            } else if (strncmp(line, "created=", 8) == 0) {
+                // Parse timestamp if needed - for now set to current time
+                new_entry->metadata.created = time(NULL);
+                new_entry->metadata.last_accessed = time(NULL);
+            }
+        }
+        fclose(meta_file);
+        
+        // Set default values if not found in metadata
+        if (new_entry->metadata.owner[0] == '\0') {
+            strcpy(new_entry->metadata.owner, "Unknown");
+        }
+        
+        // Add to hash table (use -1 for ss_socket_fd since we don't know the storage server yet)
+        if (add_file_to_table(&file_table, entry->d_name, -1, &new_entry->metadata) == 0) {
+            files_found++;
+            LOG_INFO_MSG("NAME_SERVER", "Added existing file to registry: %s (owner: %s)", 
+                        entry->d_name, new_entry->metadata.owner);
+            free(new_entry); // The function creates its own copy
+        } else {
+            LOG_ERROR_MSG("NAME_SERVER", "Failed to add file to registry: %s", entry->d_name);
+            free(new_entry);
+        }
+    }
+    
+    closedir(dir);
+    LOG_INFO_MSG("NAME_SERVER", "Scanned storage: found %d existing files", files_found);
+}
+
 int main(int argc, char* argv[]) {
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <port>\n", argv[0]);
@@ -83,6 +180,9 @@ int main(int argc, char* argv[]) {
     
     // Phase 2: Initialize state management
     init_name_server_state();
+    
+    // Scan for existing files in storage
+    scan_storage_files();
     
     // Initialize server
     initialize_server(port);
@@ -278,24 +378,45 @@ void init_name_server_state() {
     clients_list = NULL;
     init_file_hash_table(&file_table);
     
+    // Load persistent user registry
+    load_user_registry(&clients_list);
+    
     printf("Name Server state initialized:\n");
     printf("  - Storage servers list: ready\n");
     printf("  - Clients list: ready\n");
     printf("  - File hash table: %d buckets\n", HASH_TABLE_SIZE);
+    printf("  - Loaded %d users from registry\n", count_all_users(clients_list));
 }
 
 // Phase 2: Process data from connected clients/servers
 void process_connection_data(int sockfd) {
     request_packet_t request;
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    char client_ip[INET_ADDRSTRLEN];
+    int client_port = 0;
+    
+    // Get client address information for logging
+    if (getpeername(sockfd, (struct sockaddr*)&client_addr, &addr_len) == 0) {
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        client_port = ntohs(client_addr.sin_port);
+    } else {
+        strcpy(client_ip, "unknown");
+        client_port = 0;
+    }
+    
     int bytes = recv_request(sockfd, &request);
     
     if (bytes <= 0) {
         // Connection closed or error
-        printf("Connection closed: fd=%d\n", sockfd);
+        printf("[NM] Connection closed: %s:%d (fd=%d)\n", client_ip, client_port, sockfd);
+        LOG_INFO_MSG("CONNECTION", "Connection closed: %s:%d (fd=%d)", client_ip, client_port, sockfd);
         
         // Clean up from our data structures
         remove_storage_server(&storage_servers_list, sockfd);
-        remove_client(&clients_list, sockfd);
+        
+        // For clients, mark as disconnected but keep in registry
+        disconnect_user(clients_list, sockfd);
         
         close(sockfd);
         FD_CLR(sockfd, global_master_fds);
@@ -304,7 +425,8 @@ void process_connection_data(int sockfd) {
     
     // Validate packet integrity
     if (!validate_packet_integrity(&request, sizeof(request))) {
-        printf("Received corrupted packet from fd=%d\n", sockfd);
+        printf("[NM] Received corrupted packet from %s:%d (fd=%d)\n", client_ip, client_port, sockfd);
+        LOG_ERROR_MSG("PACKET", "Corrupted packet from %s:%d (fd=%d)", client_ip, client_port, sockfd);
         return;
     }
     
@@ -327,8 +449,11 @@ void process_connection_data(int sockfd) {
         case CMD_CLIENT_INIT: cmd_name = "CLIENT_INIT"; break;
         default: break;
     }
-    LOG_INFO_MSG("REQUEST", "From fd=%d user=%s | Command: %s | Args: %s", 
-                 sockfd, request.username, cmd_name, request.args);
+    // Log and display the incoming request
+    printf("[NM] REQUEST from %s@%s:%d | Command: %s | Args: %s\n", 
+           request.username, client_ip, client_port, cmd_name, request.args);
+    LOG_INFO_MSG("REQUEST", "From %s@%s:%d (fd=%d) | Command: %s | Args: %s", 
+                 request.username, client_ip, client_port, sockfd, cmd_name, request.args);
     
     // Handle different initialization commands
     switch (request.command) {
@@ -486,24 +611,35 @@ void handle_client_init(int sockfd, request_packet_t* req) {
         inet_ntop(AF_INET, &client_addr.sin_addr, user_info.client_ip, INET_ADDRSTRLEN);
     }
     
-    // Add to clients list
-    client_node_t* new_client = add_client(&clients_list, &user_info);
-    if (new_client) {
-        printf("Registered client '%s' from %s (fd=%d)\n", 
-               user_info.username, user_info.client_ip, sockfd);
+    // Add to clients list using persistent user management
+    time_t original_time = user_info.connected_time;
+    client_node_t* client = register_or_reconnect_user(&clients_list, &user_info);
+    if (client) {
+        int is_reconnect = (client->data.connected_time != original_time);
         
-        // Send success response
+        printf("[NM] User '%s' %s from %s (fd=%d)\n", 
+               user_info.username, 
+               is_reconnect ? "reconnected" : "registered",
+               user_info.client_ip, sockfd);
+        
+        // Send success response with appropriate message
         response_packet_t response;
         memset(&response, 0, sizeof(response));
         response.magic = PROTOCOL_MAGIC;
         response.status = STATUS_OK;
-        snprintf(response.data, sizeof(response.data), 
-                "Welcome %s! Connected to Docs++", user_info.username);
-        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
         
+        if (is_reconnect) {
+            snprintf(response.data, sizeof(response.data), 
+                    "Welcome back %s! Reconnected to Docs++", user_info.username);
+        } else {
+            snprintf(response.data, sizeof(response.data), 
+                    "Welcome %s! Connected to Docs++", user_info.username);
+        }
+        
+        response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
         send_response(sockfd, &response);
     } else {
-        printf("Failed to register client from fd=%d\n", sockfd);
+        printf("[NM] Failed to register/reconnect client from fd=%d\n", sockfd);
     }
 }
 
@@ -550,8 +686,26 @@ void handle_create_file(int client_fd, request_packet_t* req) {
         snprintf(response.data, sizeof(response.data), 
                 "File '%s' already exists", filename);
         response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+        
+        // Log response
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        char client_ip[INET_ADDRSTRLEN];
+        int client_port = 0;
+        
+        if (getpeername(client_fd, (struct sockaddr*)&client_addr, &addr_len) == 0) {
+            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+            client_port = ntohs(client_addr.sin_port);
+        } else {
+            strcpy(client_ip, "unknown");
+        }
+        
+        printf("[NM] RESPONSE to %s@%s:%d | Command: CREATE | Status: ERROR | File: %s | Message: File already exists\n", 
+               req->username, client_ip, client_port, filename);
+        LOG_WARNING_MSG("RESPONSE", "To %s@%s:%d (fd=%d) | Command: CREATE | Status: ERROR | File: %s | Message: %s", 
+                        req->username, client_ip, client_port, client_fd, filename, response.data);
+        
         send_response(client_fd, &response);
-        LOG_WARNING_MSG("NAME_SERVER", "File already exists: %s", filename);
         return;
     }
     
@@ -644,6 +798,25 @@ void handle_create_file(int client_fd, request_packet_t* req) {
     snprintf(response.data, sizeof(response.data), 
             "File created successfully");
     response.checksum = calculate_checksum(&response, sizeof(response) - sizeof(uint32_t));
+    
+    // Get client address for logging
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    char client_ip[INET_ADDRSTRLEN];
+    int client_port = 0;
+    
+    if (getpeername(client_fd, (struct sockaddr*)&client_addr, &addr_len) == 0) {
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        client_port = ntohs(client_addr.sin_port);
+    } else {
+        strcpy(client_ip, "unknown");
+    }
+    
+    printf("[NM] RESPONSE to %s@%s:%d | Command: CREATE | Status: SUCCESS | File: %s\n", 
+           req->username, client_ip, client_port, filename);
+    LOG_INFO_MSG("RESPONSE", "To %s@%s:%d (fd=%d) | Command: CREATE | Status: SUCCESS | File: %s | Message: %s", 
+                 req->username, client_ip, client_port, client_fd, filename, response.data);
+    
     send_response(client_fd, &response);
 }
 
@@ -728,7 +901,10 @@ void handle_delete_file(int client_fd, request_packet_t* req) {
         return;
     }
     
-    // Step 7: Remove file from Name Server's registry
+    // Step 7: Remove file from LRU cache FIRST (before freeing hash table entry)
+    remove_file_from_lru_cache(filename);
+    
+    // Step 8: Remove file from Name Server's registry
     if (remove_file_from_table(&file_table, filename) < 0) {
         LOG_ERROR_MSG("NAME_SERVER", "Failed to remove file from registry");
         // File deleted on SS but still in registry - warn but continue
@@ -737,7 +913,7 @@ void handle_delete_file(int client_fd, request_packet_t* req) {
     LOG_INFO_MSG("NAME_SERVER", "File '%s' deleted successfully by user '%s'", 
                 filename, req->username);
     
-    // Step 8: Send success response to client
+    // Step 9: Send success response to client
     response.status = STATUS_OK;
     snprintf(response.data, sizeof(response.data), 
             "File deleted successfully");
@@ -786,22 +962,23 @@ void handle_list_users(int client_fd, request_packet_t* req) {
     int offset = 0;
     int count = 0;
     
-    // Iterate through connected clients
+    // Iterate through all registered users (both active and inactive)
     client_node_t* current = clients_list;
     while (current && offset < MAX_RESPONSE_DATA_LEN - 200) {
-        if (current->data.active) {
-            char time_str[64];
-            struct tm* timeinfo = localtime(&current->data.connected_time);
-            strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
-            
-            int written = snprintf(user_list + offset, MAX_RESPONSE_DATA_LEN - offset,
-                                  "%d. %s (connected from %s at %s)\n",
-                                  ++count,
-                                  current->data.username,
-                                  current->data.client_ip,
-                                  time_str);
-            offset += written;
-        }
+        char time_str[64];
+        struct tm* timeinfo = localtime(&current->data.connected_time);
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+        
+        const char* status = current->data.active ? "ONLINE" : "OFFLINE";
+        
+        int written = snprintf(user_list + offset, MAX_RESPONSE_DATA_LEN - offset,
+                              "%d. %s [%s] (last seen from %s at %s)\n",
+                              ++count,
+                              current->data.username,
+                              status,
+                              current->data.client_ip,
+                              time_str);
+        offset += written;
         current = current->next;
     }
     
@@ -867,46 +1044,56 @@ void handle_view_files(int client_fd, request_packet_t* req) {
     // Header
     if (flag_long) {
         offset += snprintf(file_list + offset, MAX_RESPONSE_DATA_LEN - offset,
-                          "%-12s %-14s %-30s\n", "Permissions", "Owner", "Filename");
+                          "-------------------------------------------------------------------------\n");
         offset += snprintf(file_list + offset, MAX_RESPONSE_DATA_LEN - offset,
-                          "------------------------------------------------------------\n");
-    } else {
+                          "|  %-12s | %-5s | %-5s | %-18s | %-8s |\n",
+                          "Filename", "Words", "Chars", "Last Access Time", "Owner");
         offset += snprintf(file_list + offset, MAX_RESPONSE_DATA_LEN - offset,
-                          "Files:\n");
+                          "|--------------|-------|-------|--------------------|---------|\n");
     }
+    // No header for regular view - show files directly
     
     // Iterate through all files in hash table
     for (int i = 0; i < HASH_TABLE_SIZE; i++) {
         file_hash_entry_t* current = file_table.buckets[i];
         while (current && offset < MAX_RESPONSE_DATA_LEN - 100) {
+            // Validate entry has proper filename before processing
+            if (!current->metadata.filename[0] || strlen(current->metadata.filename) == 0) {
+                current = current->next;
+                continue;
+            }
+            
             // Check access
             int has_access = flag_all || check_user_has_access(current, req->username, ACCESS_READ);
             
             if (has_access) {
                 if (flag_long) {
-                    char perms[4] = "---";
-                    if (strcmp(current->metadata.owner, req->username) == 0) {
-                        strcpy(perms, "RW");
-                    } else {
-                        // Check ACL for permissions
-                        for (int j = 0; j < current->metadata.access_count; j++) {
-                            if (strcmp(current->metadata.access_list[j], req->username) == 0) {
-                                int p = current->metadata.access_permissions[j];
-                                if (p & ACCESS_READ) perms[0] = 'R';
-                                if (p & ACCESS_WRITE) perms[1] = 'W';
-                                break;
-                            }
+                    // Format last access time
+                    char time_str[20];
+                    if (current->metadata.last_accessed > 0) {
+                        struct tm* tm_info = localtime(&current->metadata.last_accessed);
+                        if (tm_info) {
+                            strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M", tm_info);
+                        } else {
+                            strcpy(time_str, "Never");
                         }
+                    } else {
+                        strcpy(time_str, "Never");
                     }
                     
+                    // Ensure owner is not empty
+                    const char* owner = (current->metadata.owner[0] != '\0') ? current->metadata.owner : "Unknown";
+                    
                     offset += snprintf(file_list + offset, MAX_RESPONSE_DATA_LEN - offset,
-                                      "%-12s %-14s %-30s\n",
-                                      perms,
-                                      current->metadata.owner,
-                                      current->metadata.filename);
+                                      "| %-12s | %5d | %5d | %-18s | %-8s |\n",
+                                      current->metadata.filename,
+                                      current->metadata.word_count,
+                                      current->metadata.char_count,
+                                      time_str,
+                                      owner);
                 } else {
                     offset += snprintf(file_list + offset, MAX_RESPONSE_DATA_LEN - offset,
-                                      "  %s\n", current->metadata.filename);
+                                      "--> %s\n", current->metadata.filename);
                 }
                 file_count++;
             }
@@ -916,7 +1103,16 @@ void handle_view_files(int client_fd, request_packet_t* req) {
     }
     
     if (file_count == 0) {
-        strcpy(file_list, "No files available.\n");
+        if (flag_all) {
+            strcpy(file_list, "No files exist in the system.\n");
+        } else {
+            snprintf(file_list, MAX_RESPONSE_DATA_LEN, 
+                    "No files accessible to user '%s'.\n", req->username);
+        }
+    } else if (flag_long) {
+        // Add closing line for table
+        offset += snprintf(file_list + offset, MAX_RESPONSE_DATA_LEN - offset,
+                          "-------------------------------------------------------------------------\n");
     }
     
     response.status = STATUS_OK;

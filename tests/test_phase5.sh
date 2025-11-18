@@ -29,7 +29,7 @@ check_servers() {
     # Check Name Server
     if ! pgrep -f "bin/name_server" > /dev/null; then
         echo -e "${RED}✗ Name Server not running${NC}"
-        echo "  Please start: ./bin/name_server $NM_PORT"
+        echo \"  Please start: ../bin/name_server $NM_PORT\"
         return 1
     else
         echo -e "${GREEN}✓ Name Server running${NC}"
@@ -38,7 +38,7 @@ check_servers() {
     # Check Storage Server
     if ! pgrep -f "bin/storage_server" > /dev/null; then
         echo -e "${RED}✗ Storage Server not running${NC}"
-        echo "  Please start: ./bin/storage_server 127.0.0.1 $NM_PORT $STORAGE_DIR $SS_PORT"
+        echo "  Please start: ../bin/storage_server 127.0.0.1 $NM_PORT $STORAGE_DIR $SS_PORT"
         return 1
     else
         echo -e "${GREEN}✓ Storage Server running${NC}"
@@ -96,12 +96,12 @@ test_read() {
     cat "$STORAGE_DIR/read_test.txt"
     echo ""
     echo -e "${YELLOW}Instructions:${NC}"
-    echo "  1. Connect as '$TEST_USER': ./bin/client $TEST_USER 127.0.0.1 $NM_PORT"
+    echo "  1. Connect as '$TEST_USER': ../bin/client $TEST_USER 127.0.0.1 $NM_PORT"
     echo "  2. Run: CREATE read_test.txt"
     echo "  3. Run: READ read_test.txt"
     echo "  4. Verify file content displays correctly"
     echo ""
-    echo "  5. Open new terminal as '$TEST_USER2': ./bin/client $TEST_USER2 127.0.0.1 $NM_PORT"
+    echo "  5. Open new terminal as '$TEST_USER2': ../bin/client $TEST_USER2 127.0.0.1 $NM_PORT"
     echo "  6. Run: READ read_test.txt (should fail - no permission)"
     echo "  7. From $TEST_USER client: ADDACCESS -R read_test.txt $TEST_USER2"
     echo "  8. From $TEST_USER2 client: READ read_test.txt (should succeed)"
@@ -267,7 +267,7 @@ test_concurrent() {
     echo ""
     echo -e "${YELLOW}Instructions:${NC}"
     echo "  1. Open 3 client terminals:"
-    echo "     Terminal 1: ./bin/client alice 127.0.0.1 $NM_PORT"
+    echo "     Terminal 1: ../bin/client alice 127.0.0.1 $NM_PORT"
     echo "     Terminal 2: ./bin/client bob 127.0.0.1 $NM_PORT"
     echo "     Terminal 3: ./bin/client charlie 127.0.0.1 $NM_PORT"
     echo ""

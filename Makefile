@@ -59,16 +59,24 @@ deps:
 	sudo apt-get update
 	sudo apt-get install -y build-essential libreadline-dev
 
-# Clean build artifacts and temporary files
+# Clean build artifacts and temporary files (preserve storage)
 clean:
 	rm -rf $(BINDIR)
 	rm -f $(LOGDIR)/*.log
+	rm -f $(LOGDIR)/user_registry.dat
 	rm -rf ss_storage/
 	rm -rf test_storage/
+	rm -rf ss_storage_test/
+	rm -rf test_storage_read/
+	rm -rf quick_test_storage/
+	rm -rf phase*_test_storage/
+	rm -rf *_test_ss*/
+	rm -rf test_ss*/
 	rm -rf .tmp/
 	rm -f *.tmp
 	rm -f core
 	rm -f a.out
+	rm -f alice_output.txt
 	find . -name "*.o" -type f -delete
 	find . -name "*.gch" -type f -delete
 	find . -name "*~" -type f -delete
@@ -76,12 +84,11 @@ clean:
 	find . -name ".DS_Store" -type f -delete
 
 # Clean everything including all storage data
-clean-all: clean
-	rm -rf $(STORAGEDIR)/*
+clean-all: clean clean-storage
 
-# Clean only storage data (preserve directory structure)
+# Clean only storage data (files and subdirectories in storage folder)
 clean-storage:
-	rm -rf $(STORAGEDIR)/*/
+	rm -rf $(STORAGEDIR)/*
 
 # Run components (for testing)
 run-name-server: $(BINDIR)/name_server
@@ -138,9 +145,9 @@ help:
 	@echo "  storage_server    - Build storage server only" 
 	@echo "  client            - Build client only"
 	@echo "  deps              - Install development dependencies"
-	@echo "  clean             - Clean build artifacts and temp files"
-	@echo "  clean-all         - Clean everything including storage"
-	@echo "  clean-storage     - Clean only storage data (preserve structure)"
+	@echo "  clean             - Clean build artifacts and temp files (preserve storage)"
+	@echo "  clean-all         - Clean everything including storage data"
+	@echo "  clean-storage     - Clean only storage files and folders"
 	@echo "  debug             - Build with debug flags"
 	@echo "  release           - Build optimized release"
 	@echo "  format            - Format source code"

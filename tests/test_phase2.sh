@@ -14,12 +14,12 @@ echo ""
 
 # Show test files
 echo "Test files in storage directory:"
-ls -la storage/ss_storage/
+ls -la ../storage/ss_storage/
 echo ""
 
 # Test 1: Start Name Server
 echo "Step 1: Starting Name Server on port 8080..."
-./bin/name_server 8080 &
+../bin/name_server 8080 &
 NS_PID=$!
 sleep 2
 echo "✓ Name Server started (PID: $NS_PID)"
@@ -28,7 +28,7 @@ echo ""
 # Test 2: Connect Storage Server with file discovery
 echo "Step 2: Starting Storage Server with file discovery..."
 echo "Expected: Name Server should register SS with discovered files"
-./bin/storage_server 127.0.0.1 8080 ./storage/ss_storage &
+../bin/storage_server 127.0.0.1 8080 ../storage/ss_storage &
 SS_PID=$!
 sleep 3
 echo ""
@@ -36,7 +36,7 @@ echo ""
 # Test 3: Connect Client with username
 echo "Step 3: Connecting Client with username..."
 echo "Expected: Name Server should register client with username"
-echo "testuser" | ./bin/client 127.0.0.1 8080 &
+echo "testuser" | ../bin/client 127.0.0.1 8080 &
 CLIENT_PID=$!
 sleep 3
 echo ""

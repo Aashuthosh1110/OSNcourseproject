@@ -23,7 +23,7 @@ echo ""
 
 # Start Name Server
 echo "Starting Name Server on port 8080..."
-./bin/name_server 8080 &
+../bin/name_server 8080 &
 NM_PID=$!
 sleep 2
 
@@ -36,7 +36,7 @@ echo "✓ Name Server started (PID: $NM_PID)"
 
 # Start Storage Server
 echo "Starting Storage Server on port 9001..."
-./bin/storage_server localhost 8080 test_storage/ss1 9001 &
+../bin/storage_server localhost 8080 ../test_storage/ss1 9001 &
 SS_PID=$!
 sleep 2
 
@@ -55,7 +55,7 @@ echo "=== Manual Testing Instructions ==="
 echo ""
 echo "1. In a NEW terminal, run:"
 echo "   cd $(pwd)"
-echo "   ./bin/client localhost 8080"
+echo "   ../bin/client localhost 8080"
 echo ""
 echo "2. When prompted for username, enter: testuser"
 echo ""

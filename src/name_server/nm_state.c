@@ -182,6 +182,25 @@ static void lru_put(const char* filename, file_hash_entry_t* entry) {
     lru_cache.count++;
 }
 
+// Remove file from LRU cache (called during DELETE operations)
+void remove_file_from_lru_cache(const char* filename) {
+    lru_node_t* current = lru_cache.head;
+    
+    while (current != NULL) {
+        if (strcmp(current->filename, filename) == 0) {
+            // Found the file in cache, remove it
+            LOG_INFO_MSG("NAME_SERVER", "Removing file '%s' from LRU cache", filename);
+            lru_remove_node(current);
+            free(current);
+            lru_cache.count--;
+            return;
+        }
+        current = current->next;
+    }
+    
+    LOG_INFO_MSG("NAME_SERVER", "File '%s' not found in LRU cache (already removed or never cached)", filename);
+}
+
 // Find file in hash table (with LRU cache)
 file_hash_entry_t* find_file_in_table(file_hash_table_t* table, const char* filename) {
     // Phase 6: Check LRU cache first
@@ -363,4 +382,103 @@ int count_clients(client_node_t* head) {
         current = current->next;
     }
     return count;
+}
+
+// Register new user or reconnect existing user (persistent state)
+client_node_t* register_or_reconnect_user(client_node_t** head, user_info_t* user_info) {
+    // First check if user already exists in registry
+    client_node_t* existing = find_client_by_username(*head, user_info->username);
+    
+    if (existing != NULL) {
+        // User exists - update their connection info and mark as active
+        existing->data.socket_fd = user_info->socket_fd;
+        existing->data.active = 1;
+        existing->data.connected_time = user_info->connected_time;
+        strncpy(existing->data.client_ip, user_info->client_ip, INET_ADDRSTRLEN - 1);
+        existing->data.client_ip[INET_ADDRSTRLEN - 1] = '\0';
+        
+        LOG_INFO_MSG("USER_REGISTRY", "User '%s' reconnected from %s (fd=%d)", 
+                     user_info->username, user_info->client_ip, user_info->socket_fd);
+        return existing;
+    } else {
+        // New user - add to registry
+        client_node_t* new_client = add_client(head, user_info);
+        if (new_client) {
+            LOG_INFO_MSG("USER_REGISTRY", "New user '%s' registered from %s (fd=%d)", 
+                         user_info->username, user_info->client_ip, user_info->socket_fd);
+            save_user_registry(*head);  // Save to persistent storage
+        }
+        return new_client;
+    }
+}
+
+// Disconnect user (mark as inactive but keep in registry)
+void disconnect_user(client_node_t* head, int socket_fd) {
+    client_node_t* client = find_client_by_fd(head, socket_fd);
+    if (client != NULL) {
+        client->data.active = 0;
+        client->data.socket_fd = -1;  // Mark socket as invalid
+        LOG_INFO_MSG("USER_REGISTRY", "User '%s' disconnected but kept in registry", 
+                     client->data.username);
+        save_user_registry(head);  // Save updated state
+    }
+}
+
+// Count all users (both active and inactive)
+int count_all_users(client_node_t* head) {
+    int count = 0;
+    client_node_t* current = head;
+    while (current != NULL) {
+        count++;
+        current = current->next;
+    }
+    return count;
+}
+
+// Save user registry to persistent storage
+void save_user_registry(client_node_t* head) {
+    FILE* fp = fopen("logs/user_registry.dat", "wb");
+    if (fp == NULL) {
+        LOG_ERROR_MSG("USER_REGISTRY", "Failed to save user registry: %s", strerror(errno));
+        return;
+    }
+    
+    client_node_t* current = head;
+    while (current != NULL) {
+        // Save user info (but not socket_fd as it's session-specific)
+        user_info_t save_info = current->data;
+        if (!save_info.active) {
+            save_info.socket_fd = -1;  // Ensure disconnected users have invalid socket
+        }
+        fwrite(&save_info, sizeof(user_info_t), 1, fp);
+        current = current->next;
+    }
+    
+    fclose(fp);
+    LOG_INFO_MSG("USER_REGISTRY", "User registry saved to persistent storage");
+}
+
+// Load user registry from persistent storage
+void load_user_registry(client_node_t** head) {
+    FILE* fp = fopen("logs/user_registry.dat", "rb");
+    if (fp == NULL) {
+        // File doesn't exist yet - this is fine for first run
+        LOG_INFO_MSG("USER_REGISTRY", "No existing user registry found - starting fresh");
+        return;
+    }
+    
+    user_info_t user_info;
+    int count = 0;
+    
+    while (fread(&user_info, sizeof(user_info_t), 1, fp) == 1) {
+        // Mark all loaded users as inactive initially
+        user_info.active = 0;
+        user_info.socket_fd = -1;
+        
+        add_client(head, &user_info);
+        count++;
+    }
+    
+    fclose(fp);
+    LOG_INFO_MSG("USER_REGISTRY", "Loaded %d users from persistent storage", count);
 }

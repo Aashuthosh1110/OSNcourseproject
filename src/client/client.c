@@ -152,7 +152,7 @@ void register_with_name_server() {
         exit(EXIT_FAILURE);
     }
     
-    LOG_INFO_MSG("CLIENT", "Successfully registered with Name Server");
+    // Successfully registered with Name Server
 }
 
 void handle_user_commands() {
@@ -191,7 +191,7 @@ void execute_command(const char* input) {
     
     command_t cmd = string_to_command(cmd_str);
     
-    LOG_INFO_MSG("CLIENT", "Executing command: %s", cmd_str);
+    // Route command based on type
     
         // Handle different commands
     if (strcasecmp(cmd_str, "HELP") == 0) {
@@ -444,8 +444,6 @@ void handle_create_command(command_t cmd, const char* args) {
         return;
     }
     
-    LOG_INFO_MSG("CLIENT", "Creating file: %s", filename);
-    
     // Create request packet
     request_packet_t request;
     memset(&request, 0, sizeof(request));
@@ -474,7 +472,6 @@ void handle_create_command(command_t cmd, const char* args) {
     // Handle response
     if (response.status == STATUS_OK) {
         printf("File '%s' created successfully!\n", filename);
-        LOG_INFO_MSG("CLIENT", "File created successfully: %s", filename);
     } else {
         printf("Error: %s\n", response.data);
         LOG_ERROR_MSG("CLIENT", "CREATE failed: %s", response.data);
@@ -490,9 +487,17 @@ void handle_write_command(command_t cmd, const char* args) {
     
     if (args == NULL || sscanf(args, "%s %d", filename, &sentence_num) != 2) {
         printf("Error: WRITE requires filename and sentence number\n");
-        printf("Usage: WRITE <filename> <sentence_num>\n");
+        printf("Usage: WRITE <filename> <sentence_num> (1-based indexing)\n");
         return;
     }
+    
+    // Use 1-based indexing for user interface
+    if (sentence_num < 1) {
+        printf("Error: Sentence number must be >= 1\n");
+        return;
+    }
+    // Convert from 1-based user input to 0-based internal indexing
+    sentence_num -= 1;
     
     // Step 1: Ask Name Server for storage server location
     request_packet_t request;
@@ -579,8 +584,8 @@ void handle_write_command(command_t cmd, const char* args) {
         return;
     }
     
-    printf("Lock acquired for sentence %d of '%s'\n", sentence_num, filename);
-    printf("Enter word updates in format: <word_index> <content>\n");
+    printf("Lock acquired for sentence %d of '%s'\n", sentence_num + 1, filename);
+    printf("Enter word updates in format: <word_index> <content> (1-based indexing)\n");
     printf("Type 'ETIRW' when done to save changes\n");
     
     // Step 7: Enter interactive word update loop
@@ -636,14 +641,45 @@ void handle_write_command(command_t cmd, const char* args) {
             break;
         }
         
-        // Parse word_index and content
+        // Parse word_index and content (allow multi-word content)
         int word_index;
-        char content[MAX_WORD_LEN];
-        if (sscanf(trimmed, "%d %s", &word_index, content) != 2) {
-            printf("Invalid format. Use: <word_index> <content> or 'ETIRW'\n");
+        char content[MAX_RESPONSE_DATA_LEN];
+        
+        // Find the first space to separate word_index from content
+        char* space_pos = strchr(trimmed, ' ');
+        if (space_pos == NULL) {
+            printf("Invalid format. Use: <word_index> <content> (1-based) or 'ETIRW'\n");
             free(line);
             continue;
         }
+        
+        // Parse word index
+        *space_pos = '\0';
+        word_index = atoi(trimmed);
+        *space_pos = ' '; // Restore the space
+        
+        // Get the content (everything after the first space)
+        char* content_start = space_pos + 1;
+        while (*content_start == ' ') content_start++; // Skip extra spaces
+        
+        if (strlen(content_start) == 0) {
+            printf("Error: Content cannot be empty\n");
+            free(line);
+            continue;
+        }
+        
+        strncpy(content, content_start, sizeof(content) - 1);
+        content[sizeof(content) - 1] = '\0';
+        
+        // Convert from 1-based user input to 0-based internal indexing
+        if (word_index < 1) {
+            printf("Error: Word index must be >= 1\n");
+            free(line);
+            continue;
+        }
+        
+        // Convert to 0-based for internal processing
+        word_index -= 1;
         
         // Send word update to Storage Server
         memset(&request, 0, sizeof(request));
@@ -667,7 +703,7 @@ void handle_write_command(command_t cmd, const char* args) {
         }
         
         if (response.status == STATUS_OK) {
-            printf("Word %d updated\n", word_index);
+            printf("Word %d updated\n", word_index); // Show 0-based index to user
         } else {
             printf("Error: %s\n", response.data);
         }
@@ -698,7 +734,7 @@ void handle_delete_command(command_t cmd, const char* args) {
         return;
     }
     
-    LOG_INFO_MSG("CLIENT", "Deleting file: %s", filename);
+    // Deleting file
     
     // Create request packet
     request_packet_t request;
@@ -728,7 +764,6 @@ void handle_delete_command(command_t cmd, const char* args) {
     // Handle response
     if (response.status == STATUS_OK) {
         printf("File '%s' deleted successfully!\n", filename);
-        LOG_INFO_MSG("CLIENT", "File deleted successfully: %s", filename);
     } else {
         printf("Error: %s\n", response.data);
         LOG_ERROR_MSG("CLIENT", "DELETE failed: %s", response.data);

@@ -152,17 +152,41 @@ int replace_word_at_position(sentence_t* sentence, int word_index, const char* w
         token = strtok(NULL, " \t\n\r");
     }
     
-    // Check if word_index is valid
-    if (word_index >= word_count) {
+    // Handle empty sentence: allow adding first word at index 0
+    // Allow appending words beyond current word count (extend sentence)
+    if (word_index < 0) {
         return -1;
     }
     
-    // Build new sentence with replaced word
+    // For empty sentences, allow adding word at index 0
+    if (word_count == 0 && word_index == 0) {
+        // Simply set the word as the entire sentence content
+        strncpy(sentence->content, word, MAX_SENTENCE_LEN - 1);
+        sentence->content[MAX_SENTENCE_LEN - 1] = '\0';
+        sentence->word_count = 1;
+        return 0;
+    }
+    
+    // Allow extending sentence by adding words at the end
+    if (word_index > word_count) {
+        return -1;  // Don't allow gaps
+    }
+    
+    // Build new sentence with replaced/appended word
     char new_content[MAX_SENTENCE_LEN];
     int offset = 0;
+    int target_word_count = (word_index == word_count) ? word_count + 1 : word_count;
     
-    for (int i = 0; i < word_count; i++) {
-        const char* current_word = (i == word_index) ? word : words[i];
+    for (int i = 0; i < target_word_count; i++) {
+        const char* current_word;
+        if (i == word_index) {
+            current_word = word;  // Use new word
+        } else if (i < word_count) {
+            current_word = words[i];  // Use existing word
+        } else {
+            continue;  // Skip this iteration for gaps
+        }
+        
         int len = strlen(current_word);
         
         if (offset + len + 1 >= MAX_SENTENCE_LEN) {
@@ -173,7 +197,7 @@ int replace_word_at_position(sentence_t* sentence, int word_index, const char* w
         offset += len;
         
         // Add space after word (except for last word)
-        if (i < word_count - 1) {
+        if (i < target_word_count - 1) {
             new_content[offset++] = ' ';
         }
     }
@@ -183,6 +207,9 @@ int replace_word_at_position(sentence_t* sentence, int word_index, const char* w
     // Copy back to sentence
     strncpy(sentence->content, new_content, MAX_SENTENCE_LEN);
     sentence->content[MAX_SENTENCE_LEN - 1] = '\0';
+    
+    // Update word count
+    sentence->word_count = target_word_count;
     
     // Update word count
     sentence->word_count = count_words_in_sentence(sentence->content);
