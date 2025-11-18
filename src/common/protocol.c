@@ -215,12 +215,24 @@ int parse_view_args(const char* args, int* show_all, int* show_details) {
         return 0; // No flags
     }
     
-    // Simple flag parsing
-    if (strstr(args, "-a") != NULL) {
-        *show_all = 1;
-    }
-    if (strstr(args, "-l") != NULL) {
-        *show_details = 1;
+    // Create a copy of args for tokenization
+    char args_copy[MAX_ARGS_LEN];
+    strncpy(args_copy, args, sizeof(args_copy) - 1);
+    args_copy[sizeof(args_copy) - 1] = '\0';
+    
+    // Tokenize by spaces
+    char* token = strtok(args_copy, " ");
+    
+    while (token != NULL) {
+        if (strcmp(token, "-a") == 0) {
+            *show_all = 1;
+        } else if (strcmp(token, "-l") == 0) {
+            *show_details = 1;
+        } else if (strcmp(token, "-al") == 0 || strcmp(token, "-la") == 0) {
+            *show_all = 1;
+            *show_details = 1;
+        }
+        token = strtok(NULL, " ");
     }
     
     return 0;

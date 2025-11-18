@@ -714,13 +714,58 @@ void* client_connection_thread(void* arg) {
                         file_buffer[bytes_read] = '\0';
                         fclose(fp);
                         
-                        // Handle empty files - if file is empty and user wants sentence 1, allow it
-                        if (file_size == 0 && sentence_num == 0) { // sentence_num is 0-based internally
+                        // Validate sentence index before starting session
+                        file_content_t validation_content;
+                        if (file_size == 0) {
+                            // Empty file - only allow sentence 0
+                            if (sentence_num != 0) {
+                                free(file_buffer);
+                                file_buffer = NULL;
+                                release_lock(filename, sentence_num, request.username);
+                                response.status = STATUS_ERROR_INTERNAL;
+                                snprintf(response.data, sizeof(response.data),
+                                        "Invalid sentence index %d (empty file, use sentence 0)", sentence_num);
+                                response.checksum = calculate_checksum(&response,
+                                                                       sizeof(response) - sizeof(uint32_t));
+                                send_response(sock, &response);
+                                break;
+                            }
                             // Initialize empty content for empty file
                             strcpy(file_buffer, "");
-                        } else if (file_size > 0) {
-                            // For non-empty files, validate sentence exists during word updates
-                            // (validation moved to word update section)
+                        } else {
+                            // Non-empty file - parse and validate sentence exists
+                            if (parse_file_into_sentences(file_buffer, &validation_content) != 0) {
+                                free(file_buffer);
+                                file_buffer = NULL;
+                                release_lock(filename, sentence_num, request.username);
+                                response.status = STATUS_ERROR_INTERNAL;
+                                snprintf(response.data, sizeof(response.data),
+                                        "Failed to parse file content");
+                                response.checksum = calculate_checksum(&response,
+                                                                       sizeof(response) - sizeof(uint32_t));
+                                send_response(sock, &response);
+                                break;
+                            }
+                            
+                            // Check if sentence index is valid (allow 0 to n for n sentences)
+                            if (sentence_num < 0 || sentence_num > validation_content.sentence_count) {
+                                free(file_buffer);
+                                file_buffer = NULL;
+                                release_lock(filename, sentence_num, request.username);
+                                response.status = STATUS_ERROR_INTERNAL;
+                                if (validation_content.sentence_count == 0) {
+                                    snprintf(response.data, sizeof(response.data),
+                                            "Invalid sentence index %d (file is empty, use sentence 0)", sentence_num);
+                                } else {
+                                    snprintf(response.data, sizeof(response.data),
+                                            "Invalid sentence index %d (valid range: 0-%d to edit existing, %d to append new sentence)", 
+                                            sentence_num, validation_content.sentence_count - 1, validation_content.sentence_count);
+                                }
+                                response.checksum = calculate_checksum(&response,
+                                                                       sizeof(response) - sizeof(uint32_t));
+                                send_response(sock, &response);
+                                break;
+                            }
                         }
                         
                         // Store session info
@@ -731,7 +776,7 @@ void* client_connection_thread(void* arg) {
                         // Send success response
                         response.status = STATUS_OK;
                         snprintf(response.data, sizeof(response.data),
-                                "Lock acquired for sentence %d", sentence_num + 1); // Show 1-based to user
+                                "Lock acquired for sentence %d", sentence_num); // Show 0-based to user
                         response.checksum = calculate_checksum(&response,
                                                                sizeof(response) - sizeof(uint32_t));
                         send_response(sock, &response);
@@ -764,7 +809,7 @@ void* client_connection_thread(void* arg) {
                             break;
                         }
                         
-                        // Handle empty files: if file is empty and trying to access sentence 0 (1-based input was 1)
+                        // Handle empty files: if file is empty and trying to access sentence 0
                         if (content.sentence_count == 0 && session_sentence == 0) {
                             // Create first sentence for empty file
                             content.sentence_count = 1;
@@ -773,24 +818,32 @@ void* client_connection_thread(void* arg) {
                             content.sentences[0].word_count = 0;
                         }
                         
-                        // Validate sentence index
-                        if (session_sentence < 0 || session_sentence >= content.sentence_count) {
-                            response.status = STATUS_ERROR_INTERNAL;
-                            snprintf(response.data, sizeof(response.data),
-                                    "Invalid sentence index %d (file has %d sentences)", 
-                                    session_sentence + 1, content.sentence_count); // Show 1-based to user
-                            response.checksum = calculate_checksum(&response,
-                                                                   sizeof(response) - sizeof(uint32_t));
-                            send_response(sock, &response);
-                            break;
+                        // Handle appending new sentence: if session_sentence == content.sentence_count
+                        if (session_sentence == content.sentence_count) {
+                            // Create new sentence for appending
+                            if (content.sentence_count >= 1000) { // Max sentences check
+                                response.status = STATUS_ERROR_INTERNAL;
+                                snprintf(response.data, sizeof(response.data),
+                                        "Maximum number of sentences reached");
+                                response.checksum = calculate_checksum(&response,
+                                                                       sizeof(response) - sizeof(uint32_t));
+                                send_response(sock, &response);
+                                break;
+                            }
+                            content.sentence_count++;
+                            memset(&content.sentences[session_sentence], 0, sizeof(sentence_t));
+                            strcpy(content.sentences[session_sentence].content, ""); // Start with empty sentence
+                            content.sentences[session_sentence].word_count = 0;
                         }
+                        
+                        // Sentence index already validated at session start
                         
                         // Replace the word in the locked sentence
                         if (replace_word_at_position(&content.sentences[session_sentence], 
                                                     word_index, word_content) != 0) {
                             response.status = STATUS_ERROR_INTERNAL;
                             snprintf(response.data, sizeof(response.data),
-                                    "Failed to replace word at position %d", word_index + 1); // Show 1-based to user
+                                    "Failed to replace word at position %d", word_index); // Show 0-based to user
                             response.checksum = calculate_checksum(&response,
                                                                    sizeof(response) - sizeof(uint32_t));
                             send_response(sock, &response);
@@ -832,7 +885,7 @@ void* client_connection_thread(void* arg) {
                         
                         response.status = STATUS_OK;
                         snprintf(response.data, sizeof(response.data),
-                                "Word %d updated to '%s'", word_index + 1, word_content); // Show 1-based to user
+                                "Word %d updated to '%s'", word_index, word_content); // Show 0-based to user
                         response.checksum = calculate_checksum(&response,
                                                                sizeof(response) - sizeof(uint32_t));
                         send_response(sock, &response);

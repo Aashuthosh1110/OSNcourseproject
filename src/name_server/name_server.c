@@ -1026,16 +1026,11 @@ void handle_view_files(int client_fd, request_packet_t* req) {
     memset(&response, 0, sizeof(response));
     response.magic = PROTOCOL_MAGIC;
     
-    // Parse flags from args
+    // Parse flags from args using the robust parser
     int flag_all = 0;
     int flag_long = 0;
     
-    if (strstr(req->args, "-a") != NULL) {
-        flag_all = 1;
-    }
-    if (strstr(req->args, "-l") != NULL) {
-        flag_long = 1;
-    }
+    parse_view_args(req->args, &flag_all, &flag_long);
     
     char file_list[MAX_RESPONSE_DATA_LEN];
     int offset = 0;
@@ -1044,12 +1039,12 @@ void handle_view_files(int client_fd, request_packet_t* req) {
     // Header
     if (flag_long) {
         offset += snprintf(file_list + offset, MAX_RESPONSE_DATA_LEN - offset,
-                          "-------------------------------------------------------------------------\n");
+                          "-------------------------------------------------------------------------------------------------------------------------\n");
         offset += snprintf(file_list + offset, MAX_RESPONSE_DATA_LEN - offset,
-                          "|  %-12s | %-5s | %-5s | %-18s | %-8s |\n",
-                          "Filename", "Words", "Chars", "Last Access Time", "Owner");
+                          "| %-8s | %-6s | %-6s | %-16s | %-8s | %-5s | %-12s |\n",
+                          "Size", "Words", "Chars", "Last Access", "Owner", "Perms", "Filename");
         offset += snprintf(file_list + offset, MAX_RESPONSE_DATA_LEN - offset,
-                          "|--------------|-------|-------|--------------------|---------|\n");
+                          "|----------|--------|--------|------------------|----------|-------|--------------|\n");
     }
     // No header for regular view - show files directly
     
@@ -1084,13 +1079,37 @@ void handle_view_files(int client_fd, request_packet_t* req) {
                     // Ensure owner is not empty
                     const char* owner = (current->metadata.owner[0] != '\0') ? current->metadata.owner : "Unknown";
                     
+                    // Determine permissions for current user
+                    char perms[6] = "-";
+                    if (strcmp(current->metadata.owner, req->username) == 0) {
+                        strcpy(perms, "RW");  // Owner has read+write
+                    } else {
+                        // Check ACL for permissions
+                        int user_perms = 0;
+                        for (int j = 0; j < current->metadata.access_count; j++) {
+                            if (strcmp(current->metadata.access_list[j], req->username) == 0) {
+                                user_perms = current->metadata.access_permissions[j];
+                                break;
+                            }
+                        }
+                        if (user_perms & ACCESS_WRITE) {
+                            strcpy(perms, "RW");
+                        } else if (user_perms & ACCESS_READ) {
+                            strcpy(perms, "R");
+                        } else {
+                            strcpy(perms, "-");
+                        }
+                    }
+                    
                     offset += snprintf(file_list + offset, MAX_RESPONSE_DATA_LEN - offset,
-                                      "| %-12s | %5d | %5d | %-18s | %-8s |\n",
-                                      current->metadata.filename,
+                                      "| %8zu | %6d | %6d | %-16s | %-8s | %-5s | %-12s |\n",
+                                      current->metadata.size,
                                       current->metadata.word_count,
                                       current->metadata.char_count,
                                       time_str,
-                                      owner);
+                                      owner,
+                                      perms,
+                                      current->metadata.filename);
                 } else {
                     offset += snprintf(file_list + offset, MAX_RESPONSE_DATA_LEN - offset,
                                       "--> %s\n", current->metadata.filename);
@@ -1112,7 +1131,7 @@ void handle_view_files(int client_fd, request_packet_t* req) {
     } else if (flag_long) {
         // Add closing line for table
         offset += snprintf(file_list + offset, MAX_RESPONSE_DATA_LEN - offset,
-                          "-------------------------------------------------------------------------\n");
+                          "-------------------------------------------------------------------------------------------------------------------------\n");
     }
     
     response.status = STATUS_OK;

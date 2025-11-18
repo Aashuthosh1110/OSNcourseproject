@@ -132,86 +132,94 @@ int count_chars_in_sentence(const char* sentence) {
  * Replace word at specified position in a sentence
  * word_index is 0-based
  */
-int replace_word_at_position(sentence_t* sentence, int word_index, const char* word) {
-    if (!sentence || !word || word_index < 0) {
+int replace_word_at_position(sentence_t* sentence, int word_index, const char* content) {
+    if (!sentence || !content || word_index < 0) {
         return -1;
     }
 
     char temp[MAX_SENTENCE_LEN];
-    char* words[100];  // Max 100 words per sentence
-    int word_count = 0;
+    char* existing_words[100];  // Existing words in sentence
+    int existing_count = 0;
     
-    // Make a copy of the sentence content
+    // Parse existing sentence into words
     strncpy(temp, sentence->content, MAX_SENTENCE_LEN - 1);
     temp[MAX_SENTENCE_LEN - 1] = '\0';
     
-    // Tokenize the sentence into words
     char* token = strtok(temp, " \t\n\r");
-    while (token != NULL && word_count < 100) {
-        words[word_count++] = token;
+    while (token != NULL && existing_count < 100) {
+        existing_words[existing_count++] = token;
         token = strtok(NULL, " \t\n\r");
     }
     
-    // Handle empty sentence: allow adding first word at index 0
-    // Allow appending words beyond current word count (extend sentence)
-    if (word_index < 0) {
-        return -1;
+    // Parse new content into words
+    char content_temp[MAX_SENTENCE_LEN];
+    char* new_words[100];  // New words from content
+    int new_count = 0;
+    
+    strncpy(content_temp, content, MAX_SENTENCE_LEN - 1);
+    content_temp[MAX_SENTENCE_LEN - 1] = '\0';
+    
+    token = strtok(content_temp, " \t\n\r");
+    while (token != NULL && new_count < 100) {
+        new_words[new_count++] = token;
+        token = strtok(NULL, " \t\n\r");
     }
     
-    // For empty sentences, allow adding word at index 0
-    if (word_count == 0 && word_index == 0) {
-        // Simply set the word as the entire sentence content
-        strncpy(sentence->content, word, MAX_SENTENCE_LEN - 1);
-        sentence->content[MAX_SENTENCE_LEN - 1] = '\0';
-        sentence->word_count = 1;
-        return 0;
+    if (new_count == 0) {
+        return -1;  // No content to insert
     }
     
-    // Allow extending sentence by adding words at the end
-    if (word_index > word_count) {
+    // Validate word_index - allow inserting at end or within existing words
+    if (word_index > existing_count) {
         return -1;  // Don't allow gaps
     }
     
-    // Build new sentence with replaced/appended word
-    char new_content[MAX_SENTENCE_LEN];
+    // Build new sentence: words[0..word_index-1] + new_content + words[word_index..end]
+    char new_sentence[MAX_SENTENCE_LEN];
     int offset = 0;
-    int target_word_count = (word_index == word_count) ? word_count + 1 : word_count;
     
-    for (int i = 0; i < target_word_count; i++) {
-        const char* current_word;
-        if (i == word_index) {
-            current_word = word;  // Use new word
-        } else if (i < word_count) {
-            current_word = words[i];  // Use existing word
-        } else {
-            continue;  // Skip this iteration for gaps
-        }
+    // Add existing words before insertion point
+    for (int i = 0; i < word_index && i < existing_count; i++) {
+        int len = strlen(existing_words[i]);
+        if (offset + len + 1 >= MAX_SENTENCE_LEN) return -1;
         
-        int len = strlen(current_word);
-        
-        if (offset + len + 1 >= MAX_SENTENCE_LEN) {
-            return -1;  // New sentence too long
-        }
-        
-        strcpy(new_content + offset, current_word);
+        strcpy(new_sentence + offset, existing_words[i]);
         offset += len;
+        if (offset < MAX_SENTENCE_LEN - 1) new_sentence[offset++] = ' ';
+    }
+    
+    // Add new words from content
+    for (int i = 0; i < new_count; i++) {
+        int len = strlen(new_words[i]);
+        if (offset + len + 1 >= MAX_SENTENCE_LEN) return -1;
         
-        // Add space after word (except for last word)
-        if (i < target_word_count - 1) {
-            new_content[offset++] = ' ';
+        strcpy(new_sentence + offset, new_words[i]);
+        offset += len;
+        if (i < new_count - 1 || word_index < existing_count) {
+            if (offset < MAX_SENTENCE_LEN - 1) new_sentence[offset++] = ' ';
         }
     }
     
-    new_content[offset] = '\0';
+    // Add remaining existing words after insertion point
+    for (int i = word_index; i < existing_count; i++) {
+        int len = strlen(existing_words[i]);
+        if (offset + len + 1 >= MAX_SENTENCE_LEN) return -1;
+        
+        if (offset > 0 && new_sentence[offset-1] != ' ') {
+            if (offset < MAX_SENTENCE_LEN - 1) new_sentence[offset++] = ' ';
+        }
+        strcpy(new_sentence + offset, existing_words[i]);
+        offset += len;
+        if (i < existing_count - 1) {
+            if (offset < MAX_SENTENCE_LEN - 1) new_sentence[offset++] = ' ';
+        }
+    }
     
-    // Copy back to sentence
-    strncpy(sentence->content, new_content, MAX_SENTENCE_LEN);
+    new_sentence[offset] = '\0';
+    
+    // Copy result back to sentence
+    strncpy(sentence->content, new_sentence, MAX_SENTENCE_LEN - 1);
     sentence->content[MAX_SENTENCE_LEN - 1] = '\0';
-    
-    // Update word count
-    sentence->word_count = target_word_count;
-    
-    // Update word count
     sentence->word_count = count_words_in_sentence(sentence->content);
     
     return 0;

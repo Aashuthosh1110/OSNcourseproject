@@ -487,17 +487,15 @@ void handle_write_command(command_t cmd, const char* args) {
     
     if (args == NULL || sscanf(args, "%s %d", filename, &sentence_num) != 2) {
         printf("Error: WRITE requires filename and sentence number\n");
-        printf("Usage: WRITE <filename> <sentence_num> (1-based indexing)\n");
+        printf("Usage: WRITE <filename> <sentence_num> (0-based indexing)\n");
         return;
     }
     
-    // Use 1-based indexing for user interface
-    if (sentence_num < 1) {
-        printf("Error: Sentence number must be >= 1\n");
+    // Use 0-based indexing throughout
+    if (sentence_num < 0) {
+        printf("Error: Sentence number must be >= 0\n");
         return;
     }
-    // Convert from 1-based user input to 0-based internal indexing
-    sentence_num -= 1;
     
     // Step 1: Ask Name Server for storage server location
     request_packet_t request;
@@ -584,8 +582,8 @@ void handle_write_command(command_t cmd, const char* args) {
         return;
     }
     
-    printf("Lock acquired for sentence %d of '%s'\n", sentence_num + 1, filename);
-    printf("Enter word updates in format: <word_index> <content> (1-based indexing)\n");
+    printf("Lock acquired for sentence %d of '%s'\n", sentence_num, filename);
+    printf("Enter word updates in format: <word_index> <content> (0-based indexing)\n");
     printf("Type 'ETIRW' when done to save changes\n");
     
     // Step 7: Enter interactive word update loop
@@ -648,7 +646,7 @@ void handle_write_command(command_t cmd, const char* args) {
         // Find the first space to separate word_index from content
         char* space_pos = strchr(trimmed, ' ');
         if (space_pos == NULL) {
-            printf("Invalid format. Use: <word_index> <content> (1-based) or 'ETIRW'\n");
+            printf("Invalid format. Use: <word_index> <content> (0-based) or 'ETIRW'\n");
             free(line);
             continue;
         }
@@ -671,15 +669,12 @@ void handle_write_command(command_t cmd, const char* args) {
         strncpy(content, content_start, sizeof(content) - 1);
         content[sizeof(content) - 1] = '\0';
         
-        // Convert from 1-based user input to 0-based internal indexing
-        if (word_index < 1) {
-            printf("Error: Word index must be >= 1\n");
+        // Use 0-based indexing throughout
+        if (word_index < 0) {
+            printf("Error: Word index must be >= 0\n");
             free(line);
             continue;
         }
-        
-        // Convert to 0-based for internal processing
-        word_index -= 1;
         
         // Send word update to Storage Server
         memset(&request, 0, sizeof(request));
